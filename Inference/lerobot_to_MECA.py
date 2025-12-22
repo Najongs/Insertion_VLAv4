@@ -38,8 +38,10 @@ ROBOT_ADDRESS = "192.168.0.100"
 ROBOT_TYPE = "meca500"
 
 # Model Configuration
-MODEL_ID = "lerobot/smolvla_base"  # Base model architecture
-CHECKPOINT_PATH = "/home/najo/NAS/VLA/Insertion_VLAv4/Train/outputs/train/smolvla_vla_insertion_multigpu/checkpoints/checkpoint_step_0016000.pt"
+MODEL_ID = "lerobot/smolvla_base"  # Base model architecture (for preprocessor)
+# Use downloaded Hugging Face model directly
+MODEL_PATH = "/home/irom/NAS/VLA/Insertion_VLAv4/sub_tasks/downloads/model"
+USE_HF_MODEL = True  # Set to True to use Hugging Face model, False to use checkpoint
 
 # Target Configuration (choose one: Blue point, Green point, Red point, White point, Yellow point)
 TARGET_COLOR = "Red point"  # Change this to target different colored insertion points
@@ -513,9 +515,32 @@ def main():
             device = get_safe_torch_device("cuda" if torch.cuda.is_available() else "cpu")
             logger.info(f"Using device: {device}")
 
-            # Load trained checkpoint instead of base model
-            logger.info(f"Loading trained checkpoint: {CHECKPOINT_PATH}")
-            policy = load_trained_checkpoint(CHECKPOINT_PATH, device)
+            # Load model
+            if USE_HF_MODEL:
+                logger.info(f"Loading Hugging Face model from: {MODEL_PATH}")
+                from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+                from lerobot.configs.types import FeatureType, PolicyFeature
+
+                policy = SmolVLAPolicy.from_pretrained(MODEL_PATH)
+
+                # Manually configure input/output features for 3 cameras
+                logger.info("Configuring input/output features...")
+                policy.config.input_features = {
+                    "observation.images.camera1": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640)),
+                    "observation.images.camera2": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640)),
+                    "observation.images.camera3": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640)),
+                    "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(6,)),
+                }
+                policy.config.output_features = {
+                    "action": PolicyFeature(type=FeatureType.ACTION, shape=(6,)),
+                }
+
+                policy.to(device)
+                policy.eval()
+                logger.info(colored("Hugging Face model loaded successfully!", "green"))
+            else:
+                logger.info(f"Loading trained checkpoint: {CHECKPOINT_PATH}")
+                policy = load_trained_checkpoint(CHECKPOINT_PATH, device)
 
             # Generate task instruction (matching training data format)
             instruction = generate_instruction(TARGET_COLOR)

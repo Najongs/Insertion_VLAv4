@@ -9,7 +9,7 @@ __pycache__/
 /.claude
 *.pt
 *.safetensors
-
+collected_data/
 # Distribution / packaging
 .Python
 build/
