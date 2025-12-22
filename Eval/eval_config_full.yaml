@@ -1,0 +1,112 @@
+# Evaluation Configuration for SmolVLA VLA Insertion (FULL DATASET)
+# This config uses ALL training episodes for comprehensive evaluation
+
+# Dataset configuration
+dataset:
+  # Root directory containing all datasets
+  root_dir: /home/najo/NAS/VLA/dataset
+
+  # Episode directories to evaluate on - ALL TRAINING EPISODES
+  episode_dirs:
+    - New_dataset2/Blue_point/data_collection_20251108_055533
+    - New_dataset2/Blue_point/data_collection_20251108_055647
+    - New_dataset2/Blue_point/data_collection_20251108_055800
+    - New_dataset2/Blue_point/data_collection_20251108_055914
+    - New_dataset2/Blue_point/data_collection_20251108_060027
+    - New_dataset2/Blue_point/data_collection_20251108_060141
+    - New_dataset2/Blue_point/data_collection_20251108_060254
+    - New_dataset2/Blue_point/data_collection_20251108_060407
+    - New_dataset2/Blue_point/data_collection_20251108_060521
+    - New_dataset2/Blue_point/data_collection_20251108_060634
+    - New_dataset2/Green_point/data_collection_20251108_053719
+    - New_dataset2/Green_point/data_collection_20251108_053848
+    - New_dataset2/Green_point/data_collection_20251108_054016
+    - New_dataset2/Green_point/data_collection_20251108_054145
+    - New_dataset2/Green_point/data_collection_20251108_054314
+    - New_dataset2/Green_point/data_collection_20251108_054442
+    - New_dataset2/Green_point/data_collection_20251108_054611
+    - New_dataset2/Green_point/data_collection_20251108_054739
+    - New_dataset2/Green_point/data_collection_20251108_054908
+    - New_dataset2/Green_point/data_collection_20251108_055036
+    - New_dataset2/Red_point/data_collection_20251108_061254
+    - New_dataset2/Red_point/data_collection_20251108_061422
+    - New_dataset2/Red_point/data_collection_20251108_061550
+    - New_dataset2/Red_point/data_collection_20251108_061717
+    - New_dataset2/Red_point/data_collection_20251108_061845
+    - New_dataset2/Red_point/data_collection_20251108_062013
+    - New_dataset2/Red_point/data_collection_20251108_062141
+    - New_dataset2/Red_point/data_collection_20251108_062308
+    - New_dataset2/Red_point/data_collection_20251108_062436
+    - New_dataset2/Red_point/data_collection_20251108_062604
+    - New_dataset2/White_point/data_collection_20251108_052043
+    - New_dataset2/White_point/data_collection_20251108_052209
+    - New_dataset2/White_point/data_collection_20251108_052336
+    - New_dataset2/White_point/data_collection_20251108_052502
+    - New_dataset2/White_point/data_collection_20251108_052629
+    - New_dataset2/White_point/data_collection_20251108_052755
+    - New_dataset2/White_point/data_collection_20251108_052922
+    - New_dataset2/White_point/data_collection_20251108_053048
+    - New_dataset2/White_point/data_collection_20251108_053215
+    - New_dataset2/White_point/data_collection_20251108_053341
+    - New_dataset2/Yellow_point/data_collection_20251108_043306
+    - New_dataset2/Yellow_point/data_collection_20251108_044458
+    - New_dataset2/Yellow_point/data_collection_20251108_044621
+    - New_dataset2/Yellow_point/data_collection_20251108_044744
+    - New_dataset2/Yellow_point/data_collection_20251108_044907
+    - New_dataset2/Yellow_point/data_collection_20251108_045030
+    - New_dataset2/Yellow_point/data_collection_20251108_045153
+    - New_dataset2/Yellow_point/data_collection_20251108_045316
+    - New_dataset2/Yellow_point/data_collection_20251108_045439
+    - New_dataset2/Yellow_point/data_collection_20251108_045602
+    - New_dataset2/Yellow_point/data_collection_20251108_045725
+
+  # Action prediction horizon
+  horizon: 1
+
+  # Window sizes for temporal data
+  sensor_window_size: 65
+  robot_window_size: 100
+
+  # Action frequency
+  action_expert_hz: 10
+
+  # State representation
+  use_joints_only: false
+  use_poses_only: true
+  use_full_action_chunk: false
+
+# Evaluation settings
+evaluation:
+  # Batch size for evaluation
+  batch_size: 8
+
+  # Number of data loading workers
+  num_workers: 4
+
+  # Number of episodes to evaluate (0 = all)
+  num_episodes: 0
+
+  # Whether to save predictions
+  save_predictions: false
+
+  # Whether to compute per-episode metrics
+  per_episode_metrics: true
+
+  # Metrics to compute
+  metrics:
+    - loss
+    - action_mse
+    - position_mse
+    - rotation_mse
+    - gripper_accuracy
+
+# Output settings
+output:
+  # Base directory for evaluation outputs
+  output_dir: outputs/eval
+
+  # Whether to save visualizations
+  save_visualizations: false
+
+  # Whether to generate evaluation report
+  generate_report: true

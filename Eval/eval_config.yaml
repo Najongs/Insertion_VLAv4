@@ -1,0 +1,73 @@
+# Evaluation Configuration for SmolVLA VLA Insertion
+# This config is used with evaluate_smolvla.py to evaluate trained checkpoints
+
+# Dataset configuration
+dataset:
+  # Root directory containing all datasets
+  root_dir: /home/najo/NAS/VLA/dataset
+
+  # Episode directories to evaluate on
+  # You can specify different episodes for evaluation or use a subset of training data
+  episode_dirs:
+    # Testing subset - 각 색상별로 2개씩 선택
+    - New_dataset2/Blue_point/data_collection_20251108_055533
+    - New_dataset2/Blue_point/data_collection_20251108_055647
+    - New_dataset2/Green_point/data_collection_20251108_053719
+    - New_dataset2/Green_point/data_collection_20251108_053848
+    - New_dataset2/Red_point/data_collection_20251108_061254
+    - New_dataset2/Red_point/data_collection_20251108_061422
+    - New_dataset2/White_point/data_collection_20251108_052043
+    - New_dataset2/White_point/data_collection_20251108_052209
+    - New_dataset2/Yellow_point/data_collection_20251108_043306
+    - New_dataset2/Yellow_point/data_collection_20251108_044458
+
+  # Action prediction horizon
+  horizon: 1
+
+  # Window sizes for temporal data
+  sensor_window_size: 65
+  robot_window_size: 100
+
+  # Action frequency
+  action_expert_hz: 10
+
+  # State representation
+  use_joints_only: false
+  use_poses_only: true
+  use_full_action_chunk: false
+
+# Evaluation settings
+evaluation:
+  # Batch size for evaluation
+  batch_size: 8
+
+  # Number of data loading workers
+  num_workers: 4
+
+  # Number of episodes to evaluate (0 = all)
+  num_episodes: 0
+
+  # Whether to save predictions
+  save_predictions: false
+
+  # Whether to compute per-episode metrics
+  per_episode_metrics: true
+
+  # Metrics to compute
+  metrics:
+    - loss
+    - action_mse
+    - position_mse
+    - rotation_mse
+    - gripper_accuracy
+
+# Output settings
+output:
+  # Base directory for evaluation outputs
+  output_dir: outputs/eval
+
+  # Whether to save visualizations
+  save_visualizations: false
+
+  # Whether to generate evaluation report
+  generate_report: true

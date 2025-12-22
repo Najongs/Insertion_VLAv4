@@ -1,0 +1,15 @@
+# Hugging Face Hub Integration Requirements
+
+# Model Upload/Download
+huggingface_hub>=0.20.0
+torch>=2.0.0
+pyyaml>=6.0
+
+# Dataset Upload
+datasets>=2.14.0
+pillow>=10.0.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Progress bar
+tqdm>=4.65.0
