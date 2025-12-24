@@ -39,12 +39,14 @@ ROBOT_TYPE = "meca500"
 
 # Model Configuration
 MODEL_ID = "lerobot/smolvla_base"  # Base model architecture (for preprocessor)
-# Use downloaded Hugging Face model directly
+# Use trained checkpoint (PRIMARY) - always uses latest checkpoint
+CHECKPOINT_PATH = "/home/irom/NAS/VLA/Insertion_VLAv4/Train/outputs/train/smolvla_new_dataset_multigpu/checkpoints/checkpoint_latest.pt"
+# Use downloaded Hugging Face model directly (FALLBACK)
 MODEL_PATH = "/home/irom/NAS/VLA/Insertion_VLAv4/sub_tasks/downloads/model"
-USE_HF_MODEL = True  # Set to True to use Hugging Face model, False to use checkpoint
+USE_HF_MODEL = False  # Set to True to use Hugging Face model, False to use checkpoint (default: checkpoint)
 
 # Target Configuration (choose one: Blue point, Green point, Red point, White point, Yellow point)
-TARGET_COLOR = "Red point"  # Change this to target different colored insertion points
+TARGET_COLOR = "red point"  # Change this to target different colored insertion points (lowercase to match training)
 
 # Camera Configuration
 CAMERA_WIDTH = 640
@@ -53,13 +55,20 @@ CAMERA_FPS = 30
 CAMERA_MANUAL_FOCUS = 105
 
 # Control Loop Configuration
-CONTROL_FREQUENCY = 5  # Hz
+CONTROL_FREQUENCY = 8  # Hz (realistic for VLA inference, was 15 but too fast)
 MAX_EPISODES = 100
 MAX_STEPS_PER_EPISODE = 1000
 
 # Action Scaling (safety limits)
-ACTION_SCALE_XYZ = 0.5  # mm per step
-ACTION_SCALE_ROT = 1.0  # degrees per step
+# NOTE: Model outputs are already in the same range as collected data (scaled by joystick)
+# So we should NOT scale again! Set to 1.0 to use model output directly.
+ACTION_SCALE_XYZ = 1.0  # No additional scaling (model output already scaled)
+ACTION_SCALE_ROT = 1.0  # No additional scaling (model output already scaled)
+
+# Time Correction: Data was collected at 15Hz, but inference runs at 8Hz
+# Model learned actions for 66.6ms steps, but we apply them for 125ms steps
+# So we need to INCREASE actions proportionally: 125ms / 66.6ms = 1.875x
+TIME_SCALE = 15.0 / 8.0  # = 1.875 (data_collection_hz / inference_hz)
 
 # Robot Motion Timeouts (seconds)
 MOVE_TIMEOUT = 180
@@ -67,7 +76,10 @@ IDLE_TIMEOUT = 30
 ERROR_RECOVERY_DELAY = 0.5
 
 # Performance Profiling
-ENABLE_PROFILING = False
+ENABLE_PROFILING = True  # Show detailed timing for camera/inference/etc
+
+# Visualization
+SHOW_CAMERA_PREVIEW = True  # Show camera frames in real-time
 
 
 class OAKCameraManager:
@@ -246,7 +258,7 @@ class RobotManager:
 
         # Move to home position
         self.logger.info('Moving to initial home position [0, 0, 0, 0, 0, 0]...')
-        self.move_angle_points([[0, 0, 0, 0, 0, 0]])
+        self.move_angle_points([[0, -20, 20, 0, 30, 60]])
         self.logger.info('Robot at home position')
         self.logger.info('Robot setup complete')
 
@@ -343,30 +355,14 @@ def generate_instruction(task_name: str) -> str:
     """Generate task instruction matching training data format.
 
     Args:
-        task_name: Target name (e.g., "Red point", "Blue point")
+        task_name: Target name (e.g., "red point", "blue point")
 
     Returns:
-        Formatted instruction string
+        Formatted instruction string (MUST match training config format)
     """
-    return f"""Environment Context:
-- This is a Meca500 robot.
-- The end-effector made by 3d printer the needle tip have to contact with {task_name}.
-- The scene is an optical table with many holes, but these are NOT targets.
-- The ONLY true insertion target is the {task_name}.
-
-Task:
-You must analyze the views and determine the needle's relative position to the {task_name}.
-Identify:
-1) needle tip location
-2) alignment relative to the {task_name} center
-3) required direction to align for insertion
-4) If the needle tip is inserted at the {task_name}, it is Done of task
-
-Respond with:
-- target visibility
-- needle alignment
-- required adjustment direction
-- distance with {task_name} and needle tip point"""
+    # Simple instruction format matching train_config_new_dataset.yaml
+    # Training used: "Insert needle into red point"
+    return f"Insert needle into {task_name}"
 
 
 def load_trained_checkpoint(checkpoint_path: str, device: torch.device):
@@ -446,6 +442,111 @@ def load_trained_checkpoint(checkpoint_path: str, device: torch.device):
     return policy
 
 
+def draw_action_graph(action_history: List[np.ndarray], width: int = 800, height: int = 400) -> np.ndarray:
+    """Draw action history as a graph.
+
+    Args:
+        action_history: List of action arrays (6-DOF)
+        width: Graph width in pixels
+        height: Graph height in pixels
+
+    Returns:
+        Graph image as numpy array (BGR)
+    """
+    # Create blank image
+    img = np.ones((height, width, 3), dtype=np.uint8) * 255
+
+    if len(action_history) < 2:
+        cv2.putText(img, "Collecting data...", (width//2 - 100, height//2),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (128, 128, 128), 2)
+        return img
+
+    # Convert to numpy array
+    actions = np.array(action_history)  # Shape: (N, 6)
+    num_steps = len(actions)
+
+    # Define colors for each DOF (BGR format)
+    colors_xyz = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]  # Blue, Green, Red
+    colors_rot = [(255, 128, 0), (255, 0, 255), (128, 255, 0)]  # Cyan, Magenta, Yellow-green
+
+    # Split into translation and rotation
+    margin = 40
+    graph_height = (height - 3 * margin) // 2
+
+    # Draw XYZ graph (top half)
+    xyz_data = actions[:, :3]
+    xyz_min, xyz_max = xyz_data.min(), xyz_data.max()
+    xyz_range = max(abs(xyz_min), abs(xyz_max), 0.1)  # Ensure non-zero range
+
+    cv2.putText(img, "Translation (XYZ)", (10, 25),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+    for dof in range(3):
+        points = []
+        for i in range(num_steps):
+            x = int(margin + (i / max(num_steps - 1, 1)) * (width - 2 * margin))
+            y_normalized = xyz_data[i, dof] / (2 * xyz_range)  # Normalize to [-0.5, 0.5]
+            y = int(margin + graph_height // 2 - y_normalized * graph_height * 0.9)
+            points.append((x, y))
+
+        # Draw line
+        for i in range(len(points) - 1):
+            cv2.line(img, points[i], points[i+1], colors_xyz[dof], 2)
+
+        # Draw legend
+        legend_x = width - 150
+        legend_y = margin + dof * 20
+        cv2.line(img, (legend_x, legend_y), (legend_x + 30, legend_y), colors_xyz[dof], 2)
+        cv2.putText(img, ["X", "Y", "Z"][dof], (legend_x + 35, legend_y + 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+
+    # Draw zero line for XYZ
+    zero_y_xyz = margin + graph_height // 2
+    cv2.line(img, (margin, zero_y_xyz), (width - margin, zero_y_xyz), (200, 200, 200), 1)
+
+    # Draw Rotation graph (bottom half)
+    rot_data = actions[:, 3:]
+    rot_min, rot_max = rot_data.min(), rot_data.max()
+    rot_range = max(abs(rot_min), abs(rot_max), 0.1)
+
+    rot_top = margin * 2 + graph_height
+    cv2.putText(img, "Rotation (Rx, Ry, Rz)", (10, rot_top + 25),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+    for dof in range(3):
+        points = []
+        for i in range(num_steps):
+            x = int(margin + (i / max(num_steps - 1, 1)) * (width - 2 * margin))
+            y_normalized = rot_data[i, dof] / (2 * rot_range)
+            y = int(rot_top + margin + graph_height // 2 - y_normalized * graph_height * 0.9)
+            points.append((x, y))
+
+        # Draw line
+        for i in range(len(points) - 1):
+            cv2.line(img, points[i], points[i+1], colors_rot[dof], 2)
+
+        # Draw legend
+        legend_x = width - 150
+        legend_y = rot_top + margin + dof * 20
+        cv2.line(img, (legend_x, legend_y), (legend_x + 30, legend_y), colors_rot[dof], 2)
+        cv2.putText(img, ["Rx", "Ry", "Rz"][dof], (legend_x + 35, legend_y + 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+
+    # Draw zero line for rotation
+    zero_y_rot = rot_top + margin + graph_height // 2
+    cv2.line(img, (margin, zero_y_rot), (width - margin, zero_y_rot), (200, 200, 200), 1)
+
+    # Draw current values
+    if num_steps > 0:
+        current = actions[-1]
+        text = f"Current: XYZ=[{current[0]:+.2f}, {current[1]:+.2f}, {current[2]:+.2f}] "
+        text += f"Rot=[{current[3]:+.2f}, {current[4]:+.2f}, {current[5]:+.2f}]"
+        cv2.putText(img, text, (10, height - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+
+    return img
+
+
 def create_observation(
     frames: Dict[str, np.ndarray],
     robot_state: np.ndarray,
@@ -477,8 +578,15 @@ def create_observation(
             cam_keys.append(cam_key)
 
     if len(frame_list) == num_cameras:
+        # Resize to 512x512 (REQUIRED: model was trained with 512x512 images)
+        import cv2
+        resized_frames = []
+        for frame in frame_list:
+            resized = cv2.resize(frame, (512, 512), interpolation=cv2.INTER_LINEAR)
+            resized_frames.append(resized)
+
         # Convert to tensor and normalize: (N, H, W, C) -> (N, C, H, W)
-        stacked_frames = np.stack(frame_list, axis=0)
+        stacked_frames = np.stack(resized_frames, axis=0)
         frame_tensor = torch.from_numpy(stacked_frames).float() / 255.0
         frame_tensor = frame_tensor.permute(0, 3, 1, 2).contiguous()
         frame_tensor = frame_tensor.to(device, non_blocking=True)
@@ -591,6 +699,10 @@ def main():
             episode_count = 0
             total_steps = 0
 
+            # Action history for plotting (keep last 100 steps)
+            action_history = []
+            max_history = 100
+
             while episode_count < MAX_EPISODES:
                 logger.info(colored(f"\n=== Episode {episode_count + 1}/{MAX_EPISODES} ===", "cyan"))
 
@@ -614,6 +726,39 @@ def main():
                         logger.warning(f"Only got {len(frames)}/{num_cameras} frames (missing: {missing_cams}), skipping")
                         time.sleep(0.01)
                         continue
+
+                    # Display camera preview with action overlay
+                    if SHOW_CAMERA_PREVIEW:
+                        display_frames = []
+                        for i in range(1, num_cameras + 1):
+                            cam_key = f"camera{i}"
+                            if cam_key in frames:
+                                # Convert RGB to BGR for OpenCV display
+                                frame_bgr = cv2.cvtColor(frames[cam_key], cv2.COLOR_RGB2BGR)
+                                # Add camera label
+                                cv2.putText(frame_bgr, cam_key, (10, 30),
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                                # Add action info (if available) - translation and rotation
+                                if step > 0:
+                                    xyz_text = f"XYZ: [{action_scaled[0]:+.2f}, {action_scaled[1]:+.2f}, {action_scaled[2]:+.2f}]"
+                                    rot_text = f"Rot: [{action_scaled[3]:+.2f}, {action_scaled[4]:+.2f}, {action_scaled[5]:+.2f}]"
+                                    cv2.putText(frame_bgr, xyz_text, (10, 60),
+                                               cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+                                    cv2.putText(frame_bgr, rot_text, (10, 85),
+                                               cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 200, 255), 1)
+                                display_frames.append(frame_bgr)
+
+                        # Stack frames horizontally
+                        if len(display_frames) == num_cameras:
+                            combined = np.hstack(display_frames)
+                            # Resize if too large
+                            if combined.shape[1] > 1920:
+                                scale = 1920 / combined.shape[1]
+                                new_width = int(combined.shape[1] * scale)
+                                new_height = int(combined.shape[0] * scale)
+                                combined = cv2.resize(combined, (new_width, new_height))
+                            cv2.imshow("VLA Inference - Camera Views", combined)
+                            cv2.waitKey(1)  # Non-blocking
 
                     # Create observation
                     if ENABLE_PROFILING:
@@ -657,25 +802,40 @@ def main():
                     if action_np.ndim == 2:
                         action_np = action_np[0]
 
+                    # Apply action and time scaling
                     action_scaled = action_np.copy()
-                    action_scaled[:3] *= ACTION_SCALE_XYZ
-                    action_scaled[3:] *= ACTION_SCALE_ROT
+                    action_scaled[:3] *= ACTION_SCALE_XYZ * TIME_SCALE
+                    action_scaled[3:] *= ACTION_SCALE_ROT * TIME_SCALE
 
                     # Execute action
                     robot_manager.move_EE_single(action_scaled)
                     total_steps += 1
 
+                    # Update action history for graph
+                    action_history.append(action_scaled.copy())
+                    if len(action_history) > max_history:
+                        action_history.pop(0)
+
+                    # Display action graph
+                    if SHOW_CAMERA_PREVIEW and total_steps % 5 == 0:  # Update graph every 5 steps
+                        graph_img = draw_action_graph(action_history)
+                        cv2.imshow("Action History", graph_img)
+                        cv2.waitKey(1)
+
                     # Logging
                     if ENABLE_PROFILING and total_steps % 10 == 0:
                         total_time = time.time() - step_start
+                        fps = 1.0 / total_time if total_time > 0 else 0
                         logger.info(
                             f"Step {total_steps}: "
-                            f"camera={t_camera*1000:.1f}ms, "
-                            f"obs_build={t_obs_build*1000:.1f}ms, "
-                            f"preprocess={t_preprocess*1000:.1f}ms, "
-                            f"inference={t_inference*1000:.1f}ms, "
-                            f"postprocess={t_postprocess*1000:.1f}ms, "
-                            f"total={total_time*1000:.1f}ms"
+                            f"cam={t_camera*1000:.0f}ms | "
+                            f"obs={t_obs_build*1000:.0f}ms | "
+                            f"pre={t_preprocess*1000:.0f}ms | "
+                            f"inf={t_inference*1000:.0f}ms | "
+                            f"post={t_postprocess*1000:.0f}ms | "
+                            f"total={total_time*1000:.0f}ms ({fps:.1f} FPS) | "
+                            f"xyz=[{action_scaled[0]:+.2f},{action_scaled[1]:+.2f},{action_scaled[2]:+.2f}] "
+                            f"rot=[{action_scaled[3]:+.2f},{action_scaled[4]:+.2f},{action_scaled[5]:+.2f}]"
                         )
                     elif not ENABLE_PROFILING and total_steps % 50 == 0:
                         logger.info(f"Step {total_steps}: action={action_scaled.round(3)}")
@@ -686,7 +846,9 @@ def main():
                     if sleep_time > 0:
                         time.sleep(sleep_time)
                     else:
-                        logger.warning(f"Step took {elapsed:.3f}s (target: {1.0/CONTROL_FREQUENCY:.3f}s)")
+                        # Only warn if significantly over target (>20% slower)
+                        if elapsed > (1.0 / CONTROL_FREQUENCY) * 1.2 and total_steps % 50 == 0:
+                            logger.warning(f"Step took {elapsed:.3f}s (target: {1.0/CONTROL_FREQUENCY:.3f}s)")
 
                 episode_duration = time.time() - episode_start_time
                 episode_count += 1
@@ -703,6 +865,8 @@ def main():
     finally:
         logger.info("Cleaning up...")
         camera_manager.close()
+        if SHOW_CAMERA_PREVIEW:
+            cv2.destroyAllWindows()
         logger.info(colored("Shutdown complete", "green"))
 
 

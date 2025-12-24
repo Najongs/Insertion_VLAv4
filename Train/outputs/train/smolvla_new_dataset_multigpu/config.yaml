@@ -1,0 +1,47 @@
+dataset:
+  augment: true
+  augment_brightness: 0.15
+  augment_contrast: 0.15
+  augment_hue: 0.03
+  augment_noise: 0.01
+  augment_saturation: 0.15
+  camera_dropout_prob: 0.0
+  horizon: 1
+  min_cameras: 3
+  root_dir: /home/irom/NAS/VLA/Insertion_VLAv4/New_dataset/collected_data/Red_point
+  task_instruction: Insert needle into red point
+  use_ee_pose: true
+  use_qpos: false
+optimizer:
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1.0e-08
+  lr: 0.0001
+  weight_decay: 1.0e-10
+output_dir: outputs/train/smolvla_new_dataset_multigpu
+policy:
+  chunk_size: 1
+  device: cuda
+  freeze_vision_encoder: false
+  n_action_steps: 1
+  n_obs_steps: 1
+  pretrained_model_path: lerobot/smolvla_base
+  train_expert_only: false
+  train_state_proj: false
+  use_multi_gpu: true
+scheduler:
+  decay_lr: 1.0e-06
+  num_decay_steps: 85415
+  num_warmup_steps: 17083
+  peak_lr: 0.0001
+seed: 1000
+training:
+  batch_size: 1
+  grad_clip_norm: 10.0
+  log_freq: 100
+  num_workers: 4
+  pin_memory: true
+  save_freq: 2000
+  shuffle: true
+  steps: 85415

@@ -1,0 +1,134 @@
+# Training Configuration for SmolVLA on New HDF5 Dataset
+# =======================================================
+
+# Random seed for reproducibility
+seed: 1000
+
+# Output directory for checkpoints and logs
+output_dir: "outputs/train/smolvla_official_augmented"
+
+# Dataset Configuration
+# ---------------------
+dataset:
+  # Root directory containing HDF5 episode files
+  root_dir: "/home/irom/NAS/VLA/Insertion_VLAv4/New_dataset/collected_data/Red_point"
+
+  # Option 1: Use all HDF5 files in root_dir (default)
+  # If hdf5_files is not specified, all *.h5 files will be loaded
+
+  # Option 2: Specify exact HDF5 files to use (uncomment to use)
+  # hdf5_files:
+  #   - "episode_20251222_225152.h5"
+  #   - "episode_20251222_225251.h5"
+  #   - "episode_20251222_225346.h5"
+  #   - "episode_20251222_225531.h5"
+  #   - "episode_20251222_225621.h5"
+  #   - "episode_20251222_225848.h5"
+  #   - "episode_20251222_230756.h5"
+  #   - "episode_20251222_230859.h5"
+  #   - "episode_20251222_231108.h5"
+  #   - "episode_20251222_232636.h5"
+  #   - "episode_20251222_232719.h5"
+  #   - "episode_20251222_232757.h5"
+  #   - "episode_20251222_232842.h5"
+  #   - "episode_20251222_232947.h5"
+  #   - "episode_20251222_233023.h5"
+  #   - "episode_20251222_233101.h5"
+  #   - "episode_20251222_233145.h5"
+  #   - "episode_20251222_233223.h5"
+
+  # Action prediction horizon (1 for single-step, >1 for action chunks)
+  horizon: 1
+
+  # State representation
+  use_qpos: false        # Use joint positions (6 dims)
+  use_ee_pose: true      # Use end-effector pose (6 dims) - default
+  # Note: If both are true, state will be 12 dims (qpos + ee_pose)
+
+  # Task instruction for VLA model
+  task_instruction: "Insert needle into red point"
+
+  # Data Augmentation
+  # -----------------
+  # Camera dropout for robustness to single/multi camera inputs
+  camera_dropout_prob: 0.0  # DISABLED: No camera dropout
+  min_cameras: 3            # Keep all 3 cameras active
+
+  # Image augmentation
+  # IMPORTANT: Color augmentation disabled to allow VLM to learn color-based features
+  # (e.g., distinguishing red marker from screw holes)
+  augment: true                  # ENABLED: Image augmentation to prevent overfitting
+  augment_brightness: 0.10       # Max brightness change (±10%, reduced from 15%)
+  augment_contrast: 0.10         # Max contrast change (±10%, reduced from 15%)
+  augment_saturation: 0.0        # DISABLED: No saturation change (was ±15%)
+  augment_hue: 0.0               # DISABLED: No hue shift (was ±10.8 degrees) - critical for color learning
+  augment_noise: 0.01            # Gaussian noise std (1%)
+
+# Policy Configuration
+# --------------------
+policy:
+  # Path to downloaded pretrained model
+  # This should be the path from Inference/lerobot_to_MECA.py
+  # pretrained_model_path: "/home/irom/NAS/VLA/Insertion_VLAv4/sub_tasks/downloads/model"
+  pretrained_model_path: "lerobot/smolvla_base"
+  # Model configuration
+  n_obs_steps: 1         # Number of observation steps
+  chunk_size: 1          # Action chunk size
+  n_action_steps: 1      # Number of action steps to predict
+
+  # Training strategy (freeze disabled to avoid tensor size mismatch errors)
+  freeze_vision_encoder: false  # Don't freeze vision encoder
+  train_expert_only: false      # Train all components
+  train_state_proj: false       # Train all layers
+
+  # Device configuration
+  device: "cuda"                # "cuda" or "cpu"
+  use_multi_gpu: false          # Use DataParallel for multi-GPU training
+
+# Training Configuration
+# ----------------------
+training:
+  # Training steps
+  # NOTE: With VLM training enabled, we need more epochs for convergence
+  # 10 epochs = 170830 steps (17083 samples * 10)
+  # Estimated time: ~48 hours (2x longer for VLM training)
+  steps: 170830          # Total training steps (10 epochs with batch_size=1)
+
+  # Batch size (MUST be 1 - do not change)
+  batch_size: 1          # Batch size MUST be 1 (larger batches cause errors)
+
+  # DataLoader settings
+  shuffle: true          # Shuffle training data
+  num_workers: 4         # Number of data loading workers
+  pin_memory: true       # Pin memory for faster GPU transfer
+
+  # Gradient clipping
+  grad_clip_norm: 10.0   # Max gradient norm
+
+  # Logging and saving
+  log_freq: 100          # Log every N steps
+  save_freq: 2000        # Save checkpoint every N steps
+
+# Optimizer Configuration
+# -----------------------
+optimizer:
+  lr: 0.0001             # Learning rate (1e-4)
+  betas: [0.9, 0.95]     # Adam betas
+  weight_decay: 0.00000000010    # Weight decay (1e-10)
+  eps: 0.00000001        # Adam epsilon (1e-8)
+
+# Scheduler Configuration
+# -----------------------
+scheduler:
+  num_warmup_steps: 17083    # Warmup steps (1 epoch)
+  num_decay_steps: 170830    # Decay steps (10 epochs, matches training steps)
+  peak_lr: 0.0001            # Peak learning rate (1e-4, same as optimizer lr)
+  decay_lr: 0.000001         # Final learning rate (1e-6)
+
+# Notes:
+# ------
+# 1. Adjust batch_size based on your GPU memory (8 works for ~24GB VRAM)
+# 2. If using multiple GPUs, set use_multi_gpu: true
+# 3. Increase steps and decay_steps for longer training (e.g., 100000)
+# 4. You can override these settings via command line:
+#    python train_smolvla_new_dataset.py --config train_config_new_dataset.yaml --batch_size 4 --steps 100000

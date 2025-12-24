@@ -198,13 +198,6 @@ class GamepadController:
         rs_x = rs_x_raw if abs(rs_x_raw) > DEADZONE else 0.0
         rs_y = rs_y_raw if abs(rs_y_raw) > DEADZONE else 0.0
 
-        # [NEW] Axis-lock for precise cardinal movement (Left Stick only)
-        # 한 축이 다른 축보다 1.5배 이상 크면, 작은 축은 0으로 (대각선 방지)
-        if abs(y_stick) > abs(x_stick) * 1.5:
-            x_stick = 0  # 상하 움직임만
-        elif abs(x_stick) > abs(y_stick) * 1.5:
-            y_stick = 0  # 좌우 움직임만
-
         # Apply scaling to movement
         y_stick *= SCALE_POS
         x_stick *= SCALE_POS
@@ -218,13 +211,24 @@ class GamepadController:
         rb = self.joystick.get_button(5)
 
         # --- 2. D-Pad (Hat) Inputs ---
+        # D-Pad는 왼쪽 스틱과 동일한 방향으로 매핑 (스케일만 다름)
         hat_x, hat_y = self.joystick.get_hat(0)
-        y_hat = -hat_x * SCALE_HAT   # D-pad LEFT/RIGHT → Y축 (좌우)
-        x_hat = hat_y * SCALE_HAT    # D-pad UP/DOWN → X축 (전후)
+        y_hat = -hat_y * SCALE_HAT   # D-pad UP/DOWN → Y축 (상하, 스틱과 동일)
+        x_hat = -hat_x * SCALE_HAT   # D-pad LEFT/RIGHT → X축 (좌우, 스틱과 동일)
 
         # --- 3. Combine Movement ---
         y = y_stick + y_hat
         x = x_stick + x_hat
+
+        # --- 3.5. Tool Frame Compensation (60° rotation) ---
+        # HOME 자세의 J6=60도 회전을 보정하기 위해 -60도 역회전 적용
+        angle = np.radians(60)
+        x_rotated = x * np.cos(angle) - y * np.sin(angle)
+        y_rotated = x * np.sin(angle) + y * np.cos(angle)
+
+        # 보정된 값으로 대체
+        x = x_rotated
+        y = y_rotated
 
         # --- 4. Rotation Mapping (Mode-dependent) ---
         if self.control_mode == 1:
@@ -250,6 +254,15 @@ class GamepadController:
             ry = (rb - lb) * SCALE_ROT  # Roll
             rz = (rt - lt) * SCALE_ROT * 2.0  # Yaw (트리거)
             z = 0  # Z축은 다른 방법으로 제어해야 함 (이 모드의 단점)
+
+        # --- 4.5. Rotation Compensation (60° rotation) ---
+        # HOME 자세의 J6=60도 회전을 보정하기 위해 rx, ry도 60도 회전 적용
+        # (rz는 Z축 기준이므로 보정 불필요)
+        angle = np.radians(60)
+        rx_rotated = rx * np.cos(angle) - ry * np.sin(angle)
+        ry_rotated = rx * np.sin(angle) + ry * np.cos(angle)
+        rx = rx_rotated
+        ry = ry_rotated
 
         target_action = np.array([y, x, z, rx, ry, rz])
 
@@ -363,11 +376,11 @@ class VLARecorder:
                     # 첫 번째 프레임으로 키 확인
                     first = data[0]["imgs"]
                     
-                    # 이미지 저장 (압축 방식 변경: gzip -> lzf)
-                    # lzf는 압축률은 조금 낮지만 속도가 매우 빠름
+                    # 이미지 저장 (gzip level 4 압축)
+                    # 균형잡힌 압축률과 속도 (파일 크기 약 50% 감소)
                     for k in first.keys():
                         img_stack = np.stack([x["imgs"][k] for x in data])
-                        img_grp.create_dataset(k, data=img_stack, compression="lzf")
+                        img_grp.create_dataset(k, data=img_stack, compression="gzip", compression_opts=4)
                     
                     # 나머지 데이터 저장
                     obs.create_dataset("qpos", data=np.stack([x["q"] for x in data]))
