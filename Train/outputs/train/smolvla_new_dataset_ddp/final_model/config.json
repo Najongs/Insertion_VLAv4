@@ -93,6 +93,5 @@
     "self_attn_every_n_layers": 2,
     "expert_width_multiplier": 0.75,
     "min_period": 0.004,
-    "max_period": 4.0,
-    "rtc_config": null
+    "max_period": 4.0
 }

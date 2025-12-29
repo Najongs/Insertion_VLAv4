@@ -1,14 +1,15 @@
 #!/bin/bash
 # =============================================================================
-# Multi-GPU Training Script for SmolVLA on New Dataset
+# Multi-GPU Training Script for SmolVLA using torchrun (DDP)
 # =============================================================================
-# This script runs training on multiple GPUs using DataParallel
+# This script runs distributed training on multiple GPUs using
+# DistributedDataParallel (DDP) via torchrun
 #
 # Usage:
-#   bash train_multi_gpu.sh
+#   bash train_ddp.sh
 #
 # To specify GPUs:
-#   CUDA_VISIBLE_DEVICES=0,1,2,3 bash train_multi_gpu.sh
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4 bash train_ddp.sh
 # =============================================================================
 
 set -e  # Exit on error
@@ -17,7 +18,7 @@ set -e  # Exit on error
 cd "$(dirname "$0")"
 
 echo "============================================="
-echo "SmolVLA Training - Multi-GPU"
+echo "SmolVLA Training - DDP (torchrun)"
 echo "============================================="
 
 # Check GPU availability
@@ -31,32 +32,20 @@ echo "Available GPUs:"
 nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv
 echo ""
 
-# Set GPUs to use (default: all available GPUs)
-if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
-    # Auto-detect number of GPUs
-    NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
-    if [ $NUM_GPUS -gt 1 ]; then
-        # Use all GPUs
-        CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((NUM_GPUS-1)))
-        export CUDA_VISIBLE_DEVICES
-        echo "Using all available GPUs: $CUDA_VISIBLE_DEVICES"
-    else
-        echo "WARNING: Only 1 GPU detected. Multi-GPU training requires at least 2 GPUs."
-        echo "Falling back to single GPU training..."
-        export CUDA_VISIBLE_DEVICES=0
-    fi
-else
-    echo "Using specified GPUs: $CUDA_VISIBLE_DEVICES"
-    NUM_GPUS=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
-fi
+# Set GPUs to use (force all 5 GPUs)
+CUDA_VISIBLE_DEVICES=0,1,2,3,4
+export CUDA_VISIBLE_DEVICES
 
+# Count number of GPUs
+NUM_GPUS=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
+echo "Using GPUs: $CUDA_VISIBLE_DEVICES"
 echo "Number of GPUs: $NUM_GPUS"
 echo ""
 
 # Training configuration
 CONFIG_FILE="train_config_new_dataset.yaml"
-BATCH_SIZE=1   # MUST be 1 (larger batches cause tensor size errors)
-STEPS=170830   # 10 epochs (17083 samples * 10) - VLM training needs more epochs
+BATCH_SIZE=1   # Per-GPU batch size
+STEPS=170830   # Total training steps
 LR=0.0001
 
 # Check if config file exists
@@ -66,7 +55,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 # Create output directory
-OUTPUT_DIR="outputs/train/smolvla_new_dataset_multigpu"
+OUTPUT_DIR="outputs/train/smolvla_new_dataset_ddp"
 mkdir -p "$OUTPUT_DIR"
 
 # Create logs directory
@@ -101,41 +90,26 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
 fi
 
 echo ""
-echo "Starting multi-GPU training..."
+echo "Starting DDP training with torchrun..."
 echo "Press Ctrl+C to stop"
 echo ""
 
-# Create temporary config file with multi-GPU enabled
-TEMP_CONFIG="/tmp/train_config_multigpu_${TIMESTAMP}.yaml"
-cp "$CONFIG_FILE" "$TEMP_CONFIG"
-
-# Update config to enable multi-GPU
-if command -v yq &> /dev/null; then
-    # If yq is available, use it to modify YAML
-    yq eval '.policy.use_multi_gpu = true' -i "$TEMP_CONFIG"
-    yq eval ".output_dir = \"$OUTPUT_DIR\"" -i "$TEMP_CONFIG"
-else
-    # Fallback: use sed (less reliable but works for simple cases)
-    sed -i 's/use_multi_gpu: false/use_multi_gpu: true/' "$TEMP_CONFIG"
-    sed -i "s|output_dir:.*|output_dir: \"$OUTPUT_DIR\"|" "$TEMP_CONFIG"
-fi
-
-echo "Multi-GPU config enabled in: $TEMP_CONFIG"
-echo ""
-
-# Run training with logging
-python train_smolvla_new_dataset.py \
-    --config "$TEMP_CONFIG" \
+# Run training with torchrun
+PYTHONPATH=/home/najo/NAS/VLA/Insertion_VLAv4/lerobot/src:$PYTHONPATH \
+torchrun \
+    --standalone \
+    --nnodes=1 \
+    --nproc_per_node=$NUM_GPUS \
+    train_smolvla_new_dataset.py \
+    --config "$CONFIG_FILE" \
     --batch_size $BATCH_SIZE \
     --steps $STEPS \
     --lr $LR \
+    --output_dir "$OUTPUT_DIR" \
     2>&1 | tee "$LOG_FILE"
 
 # Store exit code
 EXIT_CODE=$?
-
-# Clean up temporary config
-rm -f "$TEMP_CONFIG"
 
 # Check if training completed successfully
 if [ $EXIT_CODE -eq 0 ]; then

@@ -11,7 +11,7 @@ output_dir: "outputs/train/smolvla_official_augmented"
 # ---------------------
 dataset:
   # Root directory containing HDF5 episode files
-  root_dir: "/home/irom/NAS/VLA/Insertion_VLAv4/New_dataset/collected_data/Red_point"
+  root_dir: "/home/najo/NAS/VLA/dataset/New_dataset/collected_data/Red_point"
 
   # Option 1: Use all HDF5 files in root_dir (default)
   # If hdf5_files is not specified, all *.h5 files will be loaded

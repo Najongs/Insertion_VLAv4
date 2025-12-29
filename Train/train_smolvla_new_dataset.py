@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -18,7 +19,10 @@ import yaml
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
@@ -35,6 +39,39 @@ from hdf5_lerobot_adapter import create_hdf5_lerobot_dataset, hdf5_lerobot_colla
 # Initialize logging
 init_logging()
 logger = logging.getLogger(__name__)
+
+
+def setup_distributed():
+    """Initialize distributed training environment."""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+    else:
+        # Not running with torchrun, single GPU mode
+        rank = 0
+        world_size = 1
+        local_rank = 0
+
+    if world_size > 1:
+        dist.init_process_group(backend='nccl')
+        torch.cuda.set_device(local_rank)
+        logger.info(f"Distributed training initialized: rank {rank}/{world_size}, local_rank {local_rank}")
+    else:
+        logger.info("Single GPU training mode")
+
+    return rank, world_size, local_rank
+
+
+def cleanup_distributed():
+    """Cleanup distributed training."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process():
+    """Check if current process is main process (rank 0)."""
+    return not dist.is_initialized() or dist.get_rank() == 0
 
 
 def load_config(config_path: str) -> Dict:
@@ -89,7 +126,7 @@ def create_dataloader_from_config(
     config: Dict,
     is_train: bool = True
 ) -> DataLoader:
-    """Create DataLoader from configuration."""
+    """Create DataLoader from configuration with distributed support."""
     if is_train:
         training_cfg = config["training"]
         batch_size = training_cfg["batch_size"]
@@ -103,23 +140,36 @@ def create_dataloader_from_config(
         num_workers = config["training"].get("num_workers", 4)
         pin_memory = config["training"].get("pin_memory", True)
 
+    # Use DistributedSampler in distributed mode
+    sampler = None
+    if dist.is_initialized() and is_train:
+        sampler = DistributedSampler(
+            dataset,
+            shuffle=shuffle,
+            drop_last=True
+        )
+        shuffle = False  # Sampler handles shuffling
+        logger.info(f"Using DistributedSampler: {dist.get_world_size()} GPUs")
+
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
         collate_fn=hdf5_lerobot_collate_fn,
         drop_last=True if is_train else False,
     )
 
-    logger.info(f"DataLoader created: batch_size={batch_size}, num_workers={num_workers}")
+    if is_main_process():
+        logger.info(f"DataLoader created: batch_size={batch_size}, num_workers={num_workers}")
 
     return dataloader
 
 
-def create_policy_from_config(config: Dict, sample_batch: Dict) -> SmolVLAPolicy:
-    """Create SmolVLA policy from configuration."""
+def create_policy_from_config(config: Dict, sample_batch: Dict, local_rank: int = 0) -> SmolVLAPolicy:
+    """Create SmolVLA policy from configuration with DDP support."""
     policy_cfg = config["policy"]
 
     # Get state and action dimensions from sample
@@ -129,7 +179,8 @@ def create_policy_from_config(config: Dict, sample_batch: Dict) -> SmolVLAPolicy
     # Count number of cameras
     num_cameras = sum(1 for key in sample_batch.keys() if key.startswith("observation.images.camera"))
 
-    logger.info(f"Policy input: {num_cameras} cameras, state_dim={state_dim}, action_dim={action_dim}")
+    if is_main_process():
+        logger.info(f"Policy input: {num_cameras} cameras, state_dim={state_dim}, action_dim={action_dim}")
 
     # Load pretrained model (downloaded from Hugging Face or local)
     pretrained_model_path = policy_cfg.get("pretrained_model_path")
@@ -241,37 +292,31 @@ def create_policy_from_config(config: Dict, sample_batch: Dict) -> SmolVLAPolicy
         logger.error(f"Failed to load pretrained model: {e}")
         raise
 
-    # Move to device
-    device = get_safe_torch_device(policy_cfg.get("device", "cuda"))
+    # Move to device (use local_rank for DDP)
+    if dist.is_initialized():
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = get_safe_torch_device(policy_cfg.get("device", "cuda"))
+
     policy.to(device)
 
-    # Multi-GPU support
-    use_multi_gpu = policy_cfg.get("use_multi_gpu", False)
-    if use_multi_gpu and torch.cuda.device_count() > 1:
-        logger.info(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
-        
-        class DataParallelWrapper(nn.Module):
-            def __init__(self, model):
-                super().__init__()
-                self.model = model
-                self.config = model.config
-            def forward(self, batch):
-                loss, loss_dict = self.model(batch)
-                return loss
-            def __getattr__(self, name):
-                try:
-                    return super().__getattr__(name)
-                except AttributeError:
-                    return getattr(self.model, name)
-
-        wrapped_policy = DataParallelWrapper(policy)
-        policy = nn.DataParallel(wrapped_policy)
+    # Wrap with DDP if distributed
+    if dist.is_initialized():
+        policy = DDP(
+            policy,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True  # Required for SmolVLA (some params not used in all forward passes)
+        )
+        if is_main_process():
+            logger.info(f"Using DistributedDataParallel with {dist.get_world_size()} GPUs")
 
     # Count trainable parameters
-    model_to_count = policy.module.model if isinstance(policy, nn.DataParallel) else policy
+    model_to_count = policy.module if isinstance(policy, DDP) else policy
     trainable_params = sum(p.numel() for p in model_to_count.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model_to_count.parameters())
-    logger.info(f"Policy parameters: {trainable_params:,} trainable / {total_params:,} total")
+    if is_main_process():
+        logger.info(f"Policy parameters: {trainable_params:,} trainable / {total_params:,} total")
 
     return policy
 
@@ -280,9 +325,9 @@ def create_optimizer(policy: nn.Module, config: Dict) -> torch.optim.Optimizer:
     """Create optimizer from configuration."""
     opt_cfg = config["optimizer"]
 
-    # Handle DataParallel wrapped model
-    if isinstance(policy, nn.DataParallel):
-        model_to_optimize = policy.module.model
+    # Handle DDP wrapped model
+    if isinstance(policy, DDP):
+        model_to_optimize = policy.module
     else:
         model_to_optimize = policy
 
@@ -297,7 +342,8 @@ def create_optimizer(policy: nn.Module, config: Dict) -> torch.optim.Optimizer:
         eps=opt_cfg.get("eps", 1e-8),
     )
 
-    logger.info(f"Optimizer created: AdamW with lr={opt_cfg.get('lr', 1e-4)}")
+    if is_main_process():
+        logger.info(f"Optimizer created: AdamW with lr={opt_cfg.get('lr', 1e-4)}")
 
     return optimizer
 
@@ -352,17 +398,8 @@ def train_step(
     # Forward pass
     policy.train()
 
-    # Handle DataParallel
-    is_data_parallel = isinstance(policy, nn.DataParallel)
-
-    if is_data_parallel:
-        # DataParallel mode: policy returns only loss
-        loss = policy(batch)
-        loss = loss.mean()
-        loss_dict = {}
-    else:
-        # Normal mode: policy returns (loss, loss_dict)
-        loss, loss_dict = policy(batch)
+    # DDP and normal mode both return (loss, loss_dict)
+    loss, loss_dict = policy(batch)
 
     # Backward pass
     optimizer.zero_grad()
@@ -401,13 +438,19 @@ def save_checkpoint(
     config: Dict,
     output_dir: Path,
 ) -> None:
-    """Save training checkpoint (latest only, overwrites previous)."""
+    """Save training checkpoint (latest only, overwrites previous). Only saves on rank 0."""
+    if not is_main_process():
+        return
+
     checkpoint_dir = output_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    # Unwrap DDP if needed
+    model_state_dict = policy.module.state_dict() if isinstance(policy, DDP) else policy.state_dict()
+
     checkpoint = {
         "step": step,
-        "policy_state_dict": policy.state_dict(),
+        "policy_state_dict": model_state_dict,
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "config": config,
@@ -420,47 +463,62 @@ def save_checkpoint(
 
 
 def train(config: Dict, args: argparse.Namespace) -> None:
-    """Main training function."""
+    """Main training function with DDP support."""
 
-    # Setup output directory
+    # Setup distributed training
+    rank, world_size, local_rank = setup_distributed()
+
+    # Setup output directory (only on main process)
     output_dir = Path(config.get("output_dir", "outputs/train/smolvla_new_dataset"))
-    output_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Output directory: {output_dir}")
+    if is_main_process():
+        output_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Output directory: {output_dir}")
 
-    # Save config
-    config_save_path = output_dir / "config.yaml"
-    with open(config_save_path, 'w') as f:
-        yaml.dump(config, f, default_flow_style=False)
-    logger.info(f"Config saved: {config_save_path}")
+    # Wait for directory creation
+    if dist.is_initialized():
+        dist.barrier()
 
-    # Set random seed
+    # Save config (only on main process)
+    if is_main_process():
+        config_save_path = output_dir / "config.yaml"
+        with open(config_save_path, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False)
+        logger.info(f"Config saved: {config_save_path}")
+
+    # Set random seed (same for all processes for reproducibility)
     seed = config.get("seed", 1000)
-    torch.manual_seed(seed)
-    logger.info(f"Random seed: {seed}")
+    torch.manual_seed(seed + rank)  # Different seed per rank for data augmentation
+    if is_main_process():
+        logger.info(f"Random seed: {seed}")
 
     # Create dataset
-    logger.info("Creating dataset...")
+    if is_main_process():
+        logger.info("Creating dataset...")
     dataset = create_dataset_from_config(config)
 
     # Create dataloader
-    logger.info("Creating dataloader...")
+    if is_main_process():
+        logger.info("Creating dataloader...")
     dataloader = create_dataloader_from_config(dataset, config, is_train=True)
 
     # Get sample batch for policy initialization
-    logger.info("Getting sample batch...")
+    if is_main_process():
+        logger.info("Getting sample batch...")
     sample_batch = next(iter(dataloader))
 
     # Create policy
-    logger.info("Creating policy...")
-    policy = create_policy_from_config(config, sample_batch)
+    if is_main_process():
+        logger.info("Creating policy...")
+    policy = create_policy_from_config(config, sample_batch, local_rank)
     device = next(policy.parameters()).device
 
     # Create preprocessor and postprocessor
-    logger.info("Creating preprocessor and postprocessor...")
+    if is_main_process():
+        logger.info("Creating preprocessor and postprocessor...")
     pretrained_model_id = "lerobot/smolvla_base"
-    # Get the actual policy (unwrap DataParallel if needed)
-    if isinstance(policy, nn.DataParallel):
-        policy_for_config = policy.module.model
+    # Get the actual policy (unwrap DDP if needed)
+    if isinstance(policy, DDP):
+        policy_for_config = policy.module
     else:
         policy_for_config = policy
     preprocessor, postprocessor = make_pre_post_processors(
@@ -468,14 +526,17 @@ def train(config: Dict, args: argparse.Namespace) -> None:
         pretrained_model_id,
         preprocessor_overrides={"device_processor": {"device": str(device)}}
     )
-    logger.info("Preprocessor and postprocessor created")
+    if is_main_process():
+        logger.info("Preprocessor and postprocessor created")
 
     # Create optimizer
-    logger.info("Creating optimizer...")
+    if is_main_process():
+        logger.info("Creating optimizer...")
     optimizer = create_optimizer(policy, config)
 
     # Create scheduler
-    logger.info("Creating scheduler...")
+    if is_main_process():
+        logger.info("Creating scheduler...")
     scheduler = create_scheduler(optimizer, config)
 
     # Training parameters
@@ -484,23 +545,34 @@ def train(config: Dict, args: argparse.Namespace) -> None:
     save_freq = config["training"].get("save_freq", 2000)
     grad_clip_norm = config["training"].get("grad_clip_norm", 10.0)
 
-    logger.info(f"Training for {total_steps} steps")
-    logger.info(f"Log frequency: {log_freq}")
-    logger.info(f"Save frequency: {save_freq}")
+    if is_main_process():
+        logger.info(f"Training for {total_steps} steps")
+        logger.info(f"Log frequency: {log_freq}")
+        logger.info(f"Save frequency: {save_freq}")
 
     # Training loop
     step = 0
     epoch = 0
     running_metrics = {}
 
-    logger.info("Starting training...")
+    if is_main_process():
+        logger.info("Starting training...")
 
     while step < total_steps:
         epoch += 1
-        logger.info(f"Epoch {epoch}")
 
-        # Create progress bar
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
+        # Set epoch for DistributedSampler (ensures different shuffle each epoch)
+        if dist.is_initialized() and hasattr(dataloader.sampler, 'set_epoch'):
+            dataloader.sampler.set_epoch(epoch)
+
+        if is_main_process():
+            logger.info(f"Epoch {epoch}")
+
+        # Create progress bar (only on main process)
+        if is_main_process():
+            pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
+        else:
+            pbar = dataloader
 
         for batch in pbar:
             step += 1
@@ -519,8 +591,8 @@ def train(config: Dict, args: argparse.Namespace) -> None:
                     running_metrics[key] = []
                 running_metrics[key].append(value)
 
-            # Logging
-            if step % log_freq == 0:
+            # Logging (only on main process)
+            if step % log_freq == 0 and is_main_process():
                 avg_metrics = {k: sum(v) / len(v) for k, v in running_metrics.items()}
                 lr = optimizer.param_groups[0]['lr']
 
@@ -530,12 +602,13 @@ def train(config: Dict, args: argparse.Namespace) -> None:
                 log_msg += f"Time: {step_time:.3f}s"
 
                 logger.info(log_msg)
-                pbar.set_postfix(loss=avg_metrics['loss'], lr=lr)
+                if hasattr(pbar, 'set_postfix'):
+                    pbar.set_postfix(loss=avg_metrics['loss'], lr=lr)
 
                 # Reset running metrics
                 running_metrics = {}
 
-            # Save checkpoint
+            # Save checkpoint (only on main process)
             if step % save_freq == 0:
                 save_checkpoint(policy, optimizer, scheduler, step, config, output_dir)
 
@@ -544,17 +617,22 @@ def train(config: Dict, args: argparse.Namespace) -> None:
                 break
 
     # Final checkpoint
-    logger.info("Training complete!")
+    if is_main_process():
+        logger.info("Training complete!")
     save_checkpoint(policy, optimizer, scheduler, step, config, output_dir)
 
-    # Save final model (unwrap DataParallel if needed)
-    final_model_path = output_dir / "final_model"
-    if isinstance(policy, nn.DataParallel):
-        model_to_save = policy.module.model
-    else:
-        model_to_save = policy
-    model_to_save.save_pretrained(final_model_path)
-    logger.info(f"Final model saved: {final_model_path}")
+    # Save final model (unwrap DDP if needed, only on main process)
+    if is_main_process():
+        final_model_path = output_dir / "final_model"
+        if isinstance(policy, DDP):
+            model_to_save = policy.module
+        else:
+            model_to_save = policy
+        model_to_save.save_pretrained(final_model_path)
+        logger.info(f"Final model saved: {final_model_path}")
+
+    # Cleanup distributed training
+    cleanup_distributed()
 
 
 def main():
