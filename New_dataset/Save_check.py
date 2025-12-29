@@ -101,9 +101,111 @@ def play_and_inspect(file_path):
             print(f"⏱️ Total Steps: {total_steps}")
 
             # 영상 데이터 메모리 로드
+            # ✨ 자동 형식 감지 (JPEG / GZIP 모두 지원)
             video_streams = {}
-            for cam in cam_keys:
-                video_streams[cam] = images_grp[cam][:] 
+
+            # 첫 번째 카메라로 형식 확인
+            first_cam = cam_keys[0]
+            first_dataset = images_grp[first_cam]
+
+            # 실제 데이터를 읽어서 형식 감지 (가장 확실한 방법)
+            is_jpeg_format = False
+            try:
+                # 첫 번째 프레임 샘플 읽기
+                sample = first_dataset[0]
+
+                if isinstance(sample, np.ndarray):
+                    # shape가 (H, W, 3)이면 GZIP (이미 디코딩된 이미지)
+                    if len(sample.shape) == 3 and sample.shape[2] == 3:
+                        is_jpeg_format = False
+                        print(f"   💡 Sample shape: {sample.shape} → GZIP format detected")
+                    # shape가 (N,)이고 dtype이 uint8이면 JPEG (압축된 바이너리)
+                    elif len(sample.shape) == 1 and sample.dtype == np.uint8:
+                        is_jpeg_format = True
+                        print(f"   💡 Sample shape: {sample.shape} → JPEG format detected")
+                    else:
+                        # 기타 경우: dataset shape로 판단
+                        is_jpeg_format = len(first_dataset.shape) != 4
+                else:
+                    # numpy array가 아니면 JPEG일 가능성
+                    is_jpeg_format = True
+            except Exception as e:
+                print(f"   ⚠️ Format detection failed: {e}, falling back to shape check")
+                # Fallback: dataset shape로 판단
+                is_jpeg_format = len(first_dataset.shape) != 4
+
+            if is_jpeg_format:
+                print("🔄 Detected JPEG compression format - Decoding frames...")
+                for cam in cam_keys:
+                    dataset = images_grp[cam]
+                    decoded_frames = []
+                    decode_failures = 0
+
+                    # 프레임 수 확인
+                    num_frames = len(dataset)
+
+                    for idx in range(num_frames):
+                        try:
+                            # HDF5 vlen dtype 읽기 (각 요소 개별 접근)
+                            jpeg_buf = dataset[idx]
+
+                            # 디버깅: 첫 프레임 정보 출력
+                            if idx == 0 and decode_failures == 0:
+                                print(f"   🔍 Debug {cam} frame 0: type={type(jpeg_buf)}, ", end="")
+                                if isinstance(jpeg_buf, np.ndarray):
+                                    print(f"shape={jpeg_buf.shape}, dtype={jpeg_buf.dtype}")
+                                else:
+                                    print(f"len={len(jpeg_buf) if hasattr(jpeg_buf, '__len__') else 'N/A'}")
+
+                            # 데이터 타입 확인 및 변환
+                            if isinstance(jpeg_buf, np.ndarray):
+                                # 이미 numpy array인 경우 - flatten 및 uint8 변환
+                                jpeg_array = jpeg_buf.flatten().astype(np.uint8)
+                            elif isinstance(jpeg_buf, (bytes, bytearray)):
+                                # bytes인 경우 변환
+                                jpeg_array = np.frombuffer(jpeg_buf, dtype=np.uint8)
+                            else:
+                                # 기타 타입 (리스트 등)
+                                jpeg_array = np.array(jpeg_buf, dtype=np.uint8).flatten()
+
+                            # 빈 버퍼 체크
+                            if jpeg_array.size == 0:
+                                decode_failures += 1
+                                decoded_frames.append(np.zeros((480, 640, 3), dtype=np.uint8))
+                                continue
+
+                            # OpenCV가 요구하는 형식 확인: 1D contiguous uint8 array
+                            if not jpeg_array.flags['C_CONTIGUOUS']:
+                                jpeg_array = np.ascontiguousarray(jpeg_array)
+
+                            # JPEG 디코딩: bytes → BGR → RGB
+                            img_bgr = cv2.imdecode(jpeg_array, cv2.IMREAD_COLOR)
+
+                            if img_bgr is not None and img_bgr.size > 0:
+                                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                                decoded_frames.append(img_rgb)
+                            else:
+                                decode_failures += 1
+                                # 빈 프레임 추가 (에러 방지)
+                                decoded_frames.append(np.zeros((480, 640, 3), dtype=np.uint8))
+
+                        except Exception as e:
+                            decode_failures += 1
+                            if idx < 5 or decode_failures < 5:  # 처음 몇 개만 상세 로그
+                                print(f"   ⚠️ Error decoding {cam} frame {idx}: {e}")
+                            decoded_frames.append(np.zeros((480, 640, 3), dtype=np.uint8))
+
+                    video_streams[cam] = np.array(decoded_frames)
+                    if decode_failures > 0:
+                        print(f"   ⚠️ {cam}: {decode_failures}/{len(decoded_frames)} frames failed decoding (replaced with black)")
+                    else:
+                        print(f"   ✓ {cam}: {len(decoded_frames)} frames decoded")
+            else:
+                print("🔄 Detected GZIP compression format - Loading frames...")
+                for cam in cam_keys:
+                    # GZIP: 이미 디코딩된 RGB 배열
+                    video_streams[cam] = images_grp[cam][:]
+                    print(f"   ✓ {cam}: {len(video_streams[cam])} frames loaded") 
 
             # --- 2. 비디오 재생 (OpenCV) ---
             print("\n=== ⏯️ Playback Controls ===")

@@ -40,7 +40,7 @@ ROBOT_TYPE = "meca500"
 # Model Configuration
 MODEL_ID = "lerobot/smolvla_base"  # Base model architecture (for preprocessor)
 # Use trained checkpoint (PRIMARY) - always uses latest checkpoint
-CHECKPOINT_PATH = "/home/irom/NAS/VLA/Insertion_VLAv4/Train/outputs/train/smolvla_new_dataset_multigpu/checkpoints/checkpoint_latest.pt"
+CHECKPOINT_PATH = "/home/irom/NAS/VLA/Insertion_VLAv4/Inference/checkpoints/checkpoints/checkpoint_latest.pt"
 # Use downloaded Hugging Face model directly (FALLBACK)
 MODEL_PATH = "/home/irom/NAS/VLA/Insertion_VLAv4/sub_tasks/downloads/model"
 USE_HF_MODEL = False  # Set to True to use Hugging Face model, False to use checkpoint (default: checkpoint)

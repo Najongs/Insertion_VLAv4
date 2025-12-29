@@ -368,32 +368,75 @@ class VLARecorder:
             try:
                 start_time = time.time()
                 logger.info(f"💾 Saving {len(data)} steps to disk... (Background)")
-                
+
                 with h5py.File(filename, 'w') as f:
                     obs = f.create_group("observations")
                     img_grp = obs.create_group("images")
-                    
+
                     # 첫 번째 프레임으로 키 확인
                     first = data[0]["imgs"]
-                    
-                    # 이미지 저장 (gzip level 4 압축)
-                    # 균형잡힌 압축률과 속도 (파일 크기 약 50% 감소)
+
+                    # ✨ 이미지 저장 (JPEG 압축 - 5~10배 용량 감소)
+                    # Quality 95: 거의 무손실 수준, VLA 학습에 최적
+                    jpeg_quality = 95
                     for k in first.keys():
-                        img_stack = np.stack([x["imgs"][k] for x in data])
-                        img_grp.create_dataset(k, data=img_stack, compression="gzip", compression_opts=4)
-                    
-                    # 나머지 데이터 저장
-                    obs.create_dataset("qpos", data=np.stack([x["q"] for x in data]))
-                    obs.create_dataset("ee_pose", data=np.stack([x["p"] for x in data]))
-                    f.create_dataset("action", data=np.stack([x["act"] for x in data]))
-                    f.create_dataset("timestamp", data=np.stack([x["ts"] for x in data]))
-                
+                        jpeg_list = []
+                        encode_failures = 0
+                        for idx, x in enumerate(data):
+                            # 이미지 유효성 검사
+                            img = x["imgs"][k]
+                            if img is None or img.size == 0:
+                                logger.warning(f"Empty image at step {idx} for {k}")
+                                # 검은 이미지로 대체 (640x480 기본)
+                                img = np.zeros((480, 640, 3), dtype=np.uint8)
+
+                            # JPEG 인코딩 (BGR로 변환 필요 - imencode는 BGR 기대)
+                            img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                            success, jpeg_buf = cv2.imencode('.jpg', img_bgr,
+                                                            [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+                            if success and jpeg_buf is not None and len(jpeg_buf) > 0:
+                                # numpy array를 1D로 flatten (vlen 저장 위해)
+                                jpeg_list.append(jpeg_buf.flatten())
+                            else:
+                                encode_failures += 1
+                                logger.warning(f"JPEG encoding failed at step {idx} for {k}")
+                                # 최소 크기 JPEG 생성 (검은 이미지)
+                                black_img = np.zeros((480, 640, 3), dtype=np.uint8)
+                                _, fallback_buf = cv2.imencode('.jpg', black_img,
+                                                              [cv2.IMWRITE_JPEG_QUALITY, 50])
+                                jpeg_list.append(fallback_buf.flatten())
+
+                        if encode_failures > 0:
+                            logger.warning(f"⚠️ {k}: {encode_failures}/{len(data)} frames failed encoding")
+
+                        # 가변 길이 바이너리 데이터 저장 (HDF5 vlen dtype)
+                        dt = h5py.special_dtype(vlen=np.dtype('uint8'))
+                        dset = img_grp.create_dataset(k, (len(jpeg_list),), dtype=dt)
+                        for i, jpeg_data in enumerate(jpeg_list):
+                            dset[i] = jpeg_data
+
+                    # ✨ 나머지 데이터 저장 (float32로 변환 - 50% 용량 감소)
+                    # shuffle=True: 압축률 향상 (비슷한 값들을 그룹화)
+                    obs.create_dataset("qpos",
+                                      data=np.stack([x["q"] for x in data]).astype(np.float32),
+                                      compression="gzip", compression_opts=4, shuffle=True)
+                    obs.create_dataset("ee_pose",
+                                      data=np.stack([x["p"] for x in data]).astype(np.float32),
+                                      compression="gzip", compression_opts=4, shuffle=True)
+                    f.create_dataset("action",
+                                    data=np.stack([x["act"] for x in data]).astype(np.float32),
+                                    compression="gzip", compression_opts=4, shuffle=True)
+                    f.create_dataset("timestamp",
+                                    data=np.stack([x["ts"] for x in data]).astype(np.float32),
+                                    compression="gzip", compression_opts=4, shuffle=True)
+
                 duration = time.time() - start_time
-                logger.info(colored(f"✅ Save Complete: {filename} ({duration:.1f}s)", "green"))
-            
+                file_size_mb = filename.stat().st_size / (1024 * 1024)
+                logger.info(colored(f"✅ Save Complete: {filename} ({duration:.1f}s, {file_size_mb:.1f} MB)", "green"))
+
             except Exception as e:
                 logger.error(f"❌ Save Failed: {e}")
-            
+
             finally:
                 self.is_saving = False # 저장 완료 플래그 OFF
 
