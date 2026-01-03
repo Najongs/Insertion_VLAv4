@@ -6,7 +6,7 @@ dataset:
   augment_noise: 0.01
   augment_saturation: 0.0
   camera_dropout_prob: 0.0
-  horizon: 1
+  horizon: 10
   min_cameras: 3
   root_dir: /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Red_point
   task_instruction: Insert needle into red point
@@ -21,27 +21,28 @@ optimizer:
   weight_decay: 1.0e-10
 output_dir: outputs/train/smolvla_new_dataset_ddp
 policy:
-  chunk_size: 1
+  chunk_size: 10
   device: cuda
-  freeze_vision_encoder: false
-  n_action_steps: 1
+  freeze_vision_encoder: true
+  n_action_steps: 10
   n_obs_steps: 1
   pretrained_model_path: lerobot/smolvla_base
-  train_expert_only: false
-  train_state_proj: false
+  reset_action_expert: true
+  train_expert_only: true
+  train_state_proj: true
   use_multi_gpu: false
 scheduler:
   decay_lr: 1.0e-06
-  num_decay_steps: 170830
-  num_warmup_steps: 17083
+  num_decay_steps: 25000
+  num_warmup_steps: 6541
   peak_lr: 0.0001
 seed: 1000
 training:
-  batch_size: 1
+  batch_size: 14
   grad_clip_norm: 10.0
   log_freq: 100
   num_workers: 4
   pin_memory: true
-  save_freq: 2000
+  save_freq_epochs: 1.0
   shuffle: true
-  steps: 170830
+  steps: 25000

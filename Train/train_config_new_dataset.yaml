@@ -16,29 +16,8 @@ dataset:
   # Option 1: Use all HDF5 files in root_dir (default)
   # If hdf5_files is not specified, all *.h5 files will be loaded
 
-  # Option 2: Specify exact HDF5 files to use (uncomment to use)
-  # hdf5_files:
-  #   - "episode_20251222_225152.h5"
-  #   - "episode_20251222_225251.h5"
-  #   - "episode_20251222_225346.h5"
-  #   - "episode_20251222_225531.h5"
-  #   - "episode_20251222_225621.h5"
-  #   - "episode_20251222_225848.h5"
-  #   - "episode_20251222_230756.h5"
-  #   - "episode_20251222_230859.h5"
-  #   - "episode_20251222_231108.h5"
-  #   - "episode_20251222_232636.h5"
-  #   - "episode_20251222_232719.h5"
-  #   - "episode_20251222_232757.h5"
-  #   - "episode_20251222_232842.h5"
-  #   - "episode_20251222_232947.h5"
-  #   - "episode_20251222_233023.h5"
-  #   - "episode_20251222_233101.h5"
-  #   - "episode_20251222_233145.h5"
-  #   - "episode_20251222_233223.h5"
-
   # Action prediction horizon (1 for single-step, >1 for action chunks)
-  horizon: 1
+  horizon: 10            # Predict 10-step action chunks
 
   # State representation
   use_qpos: false        # Use joint positions (6 dims)
@@ -73,13 +52,20 @@ policy:
   pretrained_model_path: "lerobot/smolvla_base"
   # Model configuration
   n_obs_steps: 1         # Number of observation steps
-  chunk_size: 1          # Action chunk size
-  n_action_steps: 1      # Number of action steps to predict
+  chunk_size: 10         # Action chunk size (matches horizon)
+  n_action_steps: 10     # Number of action steps to predict
 
-  # Training strategy (freeze disabled to avoid tensor size mismatch errors)
-  freeze_vision_encoder: false  # Don't freeze vision encoder
-  train_expert_only: false      # Train all components
-  train_state_proj: false       # Train all layers
+  # Training strategy (SmolVLA official paper method)
+  # Reference: "We train only the action expert module, keeping the VLM frozen"
+  # Paper: https://arxiv.org/html/2506.01844v1
+  freeze_vision_encoder: true   # Freeze vision encoder (part of VLM)
+  train_expert_only: true       # Train action expert only, freeze VLM
+  train_state_proj: true        # Train state projection layer
+
+  # Action expert initialization strategy
+  # If true, reset action expert to random weights (clean slate)
+  # If false, use pretrained action expert weights from pretrained_model_path
+  reset_action_expert: true     # ENABLED: Reset action expert for new task learning
 
   # Device configuration
   device: "cuda"                # "cuda" or "cpu"
@@ -89,13 +75,12 @@ policy:
 # ----------------------
 training:
   # Training steps
-  # NOTE: With VLM training enabled, we need more epochs for convergence
-  # 10 epochs = 170830 steps (17083 samples * 10)
-  # Estimated time: ~48 hours (2x longer for VLM training)
-  steps: 170830          # Total training steps (10 epochs with batch_size=1)
+  # NOTE: Quick training test with 25000 steps (~3.8 epochs)
+  # Estimated time: ~3 hours (with 5 GPUs at 2.3 it/s)
+  steps: 25000           # Total training steps (reduced for faster testing)
 
-  # Batch size (MUST be 1 - do not change)
-  batch_size: 1          # Batch size MUST be 1 (larger batches cause errors)
+  # Batch size (increased with available memory)
+  batch_size: 16        # Per-GPU batch size (effective=40 with 5 GPUs)
 
   # DataLoader settings
   shuffle: true          # Shuffle training data
@@ -107,7 +92,9 @@ training:
 
   # Logging and saving
   log_freq: 100          # Log every N steps
-  save_freq: 2000        # Save checkpoint every N steps
+  save_freq_epochs: 1.0  # Save checkpoint every N epochs (auto-calculates based on batch size)
+  # Note: save_freq_epochs automatically adjusts when batch_size changes
+  # Example: 1.0 = every epoch, 0.5 = twice per epoch, 2.0 = every 2 epochs
 
 # Optimizer Configuration
 # -----------------------
@@ -120,8 +107,8 @@ optimizer:
 # Scheduler Configuration
 # -----------------------
 scheduler:
-  num_warmup_steps: 17083    # Warmup steps (1 epoch)
-  num_decay_steps: 170830    # Decay steps (10 epochs, matches training steps)
+  num_warmup_steps: 6541     # Warmup steps (1 epoch)
+  num_decay_steps: 25000     # Decay steps (matches training steps)
   peak_lr: 0.0001            # Peak learning rate (1e-4, same as optimizer lr)
   decay_lr: 0.000001         # Final learning rate (1e-6)
 

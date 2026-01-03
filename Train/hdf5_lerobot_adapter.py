@@ -116,12 +116,51 @@ class HDF5LeRobotDataset(Dataset):
         else:
             self.state_dim = 6  # ee_pose only (default)
 
+        # Detect image format (JPEG vs GZIP)
+        self.is_jpeg_format = self._detect_image_format()
+
         logger.info(f"Loaded HDF5 episode: {self.hdf5_path.name}")
         logger.info(f"  Episode index: {self.episode_index}")
         logger.info(f"  Total frames: {self.num_frames}")
         logger.info(f"  Cameras: {self.num_cameras}")
+        logger.info(f"  Image format: {'JPEG (compressed)' if self.is_jpeg_format else 'GZIP (uncompressed)'}")
         logger.info(f"  State dim: {self.state_dim} ({'qpos+ee_pose' if use_qpos and use_ee_pose else 'qpos' if use_qpos else 'ee_pose'})")
         logger.info(f"  Task: {self.task}")
+
+    def _detect_image_format(self) -> bool:
+        """
+        Detect whether images are stored in JPEG (compressed) or GZIP (uncompressed) format.
+
+        Returns:
+            True if JPEG format, False if GZIP format
+        """
+        try:
+            # Get first camera dataset
+            images_grp = self.h5file['observations']['images']
+            first_cam = sorted(list(images_grp.keys()))[0]
+            first_dataset = images_grp[first_cam]
+
+            # Read first frame to detect format
+            sample = first_dataset[0]
+
+            if isinstance(sample, np.ndarray):
+                # Check shape to determine format
+                if len(sample.shape) == 3 and sample.shape[2] == 3:
+                    # Shape is (H, W, 3) → GZIP (already decoded image)
+                    return False
+                elif len(sample.shape) == 1 and sample.dtype == np.uint8:
+                    # Shape is (N,) with uint8 → JPEG (compressed binary)
+                    return True
+                else:
+                    # Fallback: check dataset shape
+                    return len(first_dataset.shape) != 4
+            else:
+                # Not a numpy array → likely JPEG
+                return True
+
+        except Exception as e:
+            logger.warning(f"Format detection failed: {e}, assuming GZIP format")
+            return False
 
     def __len__(self) -> int:
         # Subtract horizon-1 to ensure we can always get full action sequences
@@ -210,8 +249,35 @@ class HDF5LeRobotDataset(Dataset):
                     lerobot_sample[f"observation.images.{cam_key}"] = torch.zeros(3, 512, 512)
                     continue
 
-                # Load image from HDF5: (H, W, C) in [0, 255]
-                img_np = self.h5file['observations']['images'][cam_key][idx]
+                # Load image from HDF5
+                raw_data = self.h5file['observations']['images'][cam_key][idx]
+
+                # Decode based on format
+                if self.is_jpeg_format:
+                    # JPEG format: decode compressed binary
+                    if isinstance(raw_data, np.ndarray):
+                        jpeg_array = raw_data.flatten().astype(np.uint8)
+                    elif isinstance(raw_data, (bytes, bytearray)):
+                        jpeg_array = np.frombuffer(raw_data, dtype=np.uint8)
+                    else:
+                        jpeg_array = np.array(raw_data, dtype=np.uint8).flatten()
+
+                    # Ensure contiguous array for cv2
+                    if not jpeg_array.flags['C_CONTIGUOUS']:
+                        jpeg_array = np.ascontiguousarray(jpeg_array)
+
+                    # Decode JPEG: bytes → BGR → RGB
+                    img_bgr = cv2.imdecode(jpeg_array, cv2.IMREAD_COLOR)
+                    if img_bgr is None:
+                        raise ValueError(f"Failed to decode JPEG data (size: {jpeg_array.size})")
+                    img_np = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                else:
+                    # GZIP format: already decoded RGB array
+                    img_np = raw_data
+
+                # Verify image shape
+                if len(img_np.shape) != 3 or img_np.shape[2] != 3:
+                    raise ValueError(f"Invalid image shape: {img_np.shape}, expected (H, W, 3)")
 
                 # Resize to 512x512 (required by SmolVLA model)
                 img_np = cv2.resize(img_np, (512, 512), interpolation=cv2.INTER_LINEAR)
@@ -274,8 +340,11 @@ class HDF5LeRobotDataset(Dataset):
 
     def __del__(self):
         """Close HDF5 file when dataset is destroyed."""
-        if hasattr(self, 'h5file'):
-            self.h5file.close()
+        if hasattr(self, 'h5file') and self.h5file is not None:
+            try:
+                self.h5file.close()
+            except:
+                pass
 
 
 def create_hdf5_lerobot_dataset(

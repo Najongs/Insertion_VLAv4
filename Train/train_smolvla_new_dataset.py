@@ -286,6 +286,14 @@ def create_policy_from_config(config: Dict, sample_batch: Dict, local_rank: int 
         final_trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
         logger.info(f"After freeze settings: {final_trainable:,} / {initial_total:,} params trainable")
 
+        # Reset action expert weights if requested (for clean slate training)
+        if policy_cfg.get("reset_action_expert", False):
+            logger.info("=" * 60)
+            logger.info("RESET ACTION EXPERT MODE ENABLED")
+            logger.info("VLM will use pretrained weights, but action expert starts fresh")
+            logger.info("=" * 60)
+            reset_action_expert_weights(policy)
+
         logger.info("Pretrained policy loaded successfully")
 
     except Exception as e:
@@ -319,6 +327,64 @@ def create_policy_from_config(config: Dict, sample_batch: Dict, local_rank: int 
         logger.info(f"Policy parameters: {trainable_params:,} trainable / {total_params:,} total")
 
     return policy
+
+
+def reset_action_expert_weights(policy: SmolVLAPolicy) -> None:
+    """
+    Reset action expert weights to random initialization.
+    This allows using pretrained VLM while starting fresh with action expert.
+
+    Resets:
+    - lm_expert (action transformer layers)
+    - state_proj
+    - action_in_proj, action_out_proj
+    - action_time_mlp_in, action_time_mlp_out
+    """
+    logger.info("🔄 Resetting action expert weights to random initialization...")
+
+    # Helper function to reinitialize module
+    def reinit_module(module):
+        for name, param in module.named_parameters():
+            if 'weight' in name:
+                if param.ndim >= 2:
+                    # Use Xavier uniform for weights
+                    nn.init.xavier_uniform_(param)
+                else:
+                    # Use normal init for 1D weights
+                    nn.init.normal_(param, mean=0.0, std=0.02)
+            elif 'bias' in name:
+                # Zero init for biases
+                nn.init.zeros_(param)
+
+    # Reset action expert transformer layers
+    if hasattr(policy.model.vlm_with_expert, 'lm_expert'):
+        logger.info("  - Resetting lm_expert (action transformer layers)")
+        reinit_module(policy.model.vlm_with_expert.lm_expert)
+
+    # Reset state projection
+    if hasattr(policy.model, 'state_proj'):
+        logger.info("  - Resetting state_proj")
+        reinit_module(policy.model.state_proj)
+
+    # Reset action projections
+    if hasattr(policy.model, 'action_in_proj'):
+        logger.info("  - Resetting action_in_proj")
+        reinit_module(policy.model.action_in_proj)
+
+    if hasattr(policy.model, 'action_out_proj'):
+        logger.info("  - Resetting action_out_proj")
+        reinit_module(policy.model.action_out_proj)
+
+    # Reset time MLPs
+    if hasattr(policy.model, 'action_time_mlp_in'):
+        logger.info("  - Resetting action_time_mlp_in")
+        reinit_module(policy.model.action_time_mlp_in)
+
+    if hasattr(policy.model, 'action_time_mlp_out'):
+        logger.info("  - Resetting action_time_mlp_out")
+        reinit_module(policy.model.action_time_mlp_out)
+
+    logger.info("✅ Action expert weights reset complete!")
 
 
 def create_optimizer(policy: nn.Module, config: Dict) -> torch.optim.Optimizer:
@@ -438,7 +504,7 @@ def save_checkpoint(
     config: Dict,
     output_dir: Path,
 ) -> None:
-    """Save training checkpoint (latest only, overwrites previous). Only saves on rank 0."""
+    """Save training checkpoint. Saves both step-specific and latest checkpoints. Only saves on rank 0."""
     if not is_main_process():
         return
 
@@ -456,10 +522,15 @@ def save_checkpoint(
         "config": config,
     }
 
-    # Save as latest (overwrites previous checkpoint)
+    # Save as step-specific checkpoint
+    step_path = checkpoint_dir / f"checkpoint_step_{step}.pt"
+    torch.save(checkpoint, step_path)
+
+    # Also save as latest (overwrites previous)
     latest_path = checkpoint_dir / "checkpoint_latest.pt"
     torch.save(checkpoint, latest_path)
-    logger.info(f"Checkpoint saved: {latest_path} (step {step})")
+
+    logger.info(f"💾 Checkpoint saved: {step_path.name} (step {step})")
 
 
 def train(config: Dict, args: argparse.Namespace) -> None:
@@ -542,8 +613,24 @@ def train(config: Dict, args: argparse.Namespace) -> None:
     # Training parameters
     total_steps = config["training"]["steps"]
     log_freq = config["training"].get("log_freq", 100)
-    save_freq = config["training"].get("save_freq", 2000)
     grad_clip_norm = config["training"].get("grad_clip_norm", 10.0)
+
+    # Auto-calculate save_freq based on epochs if specified
+    if "save_freq_epochs" in config["training"]:
+        save_freq_epochs = config["training"]["save_freq_epochs"]
+        batch_size = config["training"]["batch_size"]
+        effective_batch_size = batch_size * world_size
+        steps_per_epoch = len(dataset) // effective_batch_size
+        save_freq = int(steps_per_epoch * save_freq_epochs)
+
+        if is_main_process():
+            logger.info(f"Auto-calculating save_freq from save_freq_epochs={save_freq_epochs}")
+            logger.info(f"  Dataset size: {len(dataset)}")
+            logger.info(f"  Effective batch size: {effective_batch_size} (batch={batch_size} x GPUs={world_size})")
+            logger.info(f"  Steps per epoch: {steps_per_epoch}")
+            logger.info(f"  → save_freq = {save_freq} steps (every {save_freq_epochs} epochs)")
+    else:
+        save_freq = config["training"].get("save_freq", 2000)
 
     if is_main_process():
         logger.info(f"Training for {total_steps} steps")
