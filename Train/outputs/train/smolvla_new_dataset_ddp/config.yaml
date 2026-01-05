@@ -38,7 +38,7 @@ scheduler:
   peak_lr: 0.0001
 seed: 1000
 training:
-  batch_size: 14
+  batch_size: 64
   grad_clip_norm: 10.0
   log_freq: 100
   num_workers: 4

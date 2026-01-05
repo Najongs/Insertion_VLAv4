@@ -44,7 +44,7 @@ echo ""
 
 # Training configuration
 CONFIG_FILE="train_config_new_dataset.yaml"
-BATCH_SIZE=14   # Per-GPU batch size (effective=40 with 5 GPUs)
+BATCH_SIZE=64   # Per-GPU batch size (effective=40 with 5 GPUs)
 STEPS=25000    # Total training steps (reduced for faster testing)
 LR=0.0001
 
