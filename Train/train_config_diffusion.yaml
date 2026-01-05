@@ -1,0 +1,111 @@
+# Training Configuration for Diffusion Policy
+# ============================================
+# Diffusion Policy excels at contact-rich manipulation and smooth trajectories
+# Proven 95.7% success on tight-clearance insertion (TacDiffusion)
+
+# Random seed for reproducibility
+seed: 1000
+
+# Output directory for checkpoints and logs
+output_dir: "outputs/train/diffusion_needle_insertion"
+
+# Dataset Configuration
+# ---------------------
+dataset:
+  # Root directory containing HDF5 episode files
+  root_dir: "/home/najo/NAS/VLA/dataset/New_dataset/collected_data/Red_point"
+
+  # Action prediction horizon (Diffusion Policy uses shorter horizons than ACT)
+  # Typically 16 for precise manipulation
+  horizon: 16
+
+  # State representation
+  use_qpos: false        # Use joint positions (6 dims)
+  use_ee_pose: true      # Use end-effector pose (6 dims) - default
+
+  # Task instruction (not used by Diffusion Policy, but kept for dataset compatibility)
+  task_instruction: "Insert needle into red point"
+
+  # Data Augmentation
+  # -----------------
+  # Diffusion Policy is robust to aggressive augmentation
+  augment: true
+  augment_brightness: 0.20       # Max brightness change (±20%)
+  augment_contrast: 0.20         # Max contrast change (±20%)
+  augment_saturation: 0.15       # Saturation change (±15%)
+  augment_hue: 0.05              # Hue shift (±18 degrees)
+  augment_noise: 0.02            # Gaussian noise std (2%)
+
+# Policy Configuration
+# --------------------
+policy:
+  # Pretrained model (if available)
+  # For now, we'll train from scratch as diffusion_pusht is 2D task
+  pretrained_model_id: null  # "lerobot/diffusion_pusht" is for 2D PushT
+
+  # Observation configuration
+  n_obs_steps: 2         # Number of observation steps (temporal stacking)
+
+  # Action configuration
+  horizon: 16            # Predict 16-step action sequence
+  n_action_steps: 8      # Execute first 8 actions (50% of horizon)
+
+  # Diffusion-specific settings
+  num_inference_steps: 100   # DDPM sampling steps (100 for training, can reduce for inference)
+
+  # Network architecture
+  down_dims: [256, 512, 1024]  # Encoder dimensions (controls model capacity)
+
+# Training Configuration
+# ----------------------
+training:
+  # Training steps
+  # Diffusion Policy typically needs more steps than ACT
+  steps: 100000          # 100k steps (~15 epochs with batch_size=8)
+
+  # Batch size (Diffusion can use smaller batches due to diffusion process)
+  batch_size: 8          # Per-GPU batch size (effective=40 with 5 GPUs)
+
+  # DataLoader settings
+  shuffle: true
+  num_workers: 4
+  pin_memory: true
+
+  # Gradient clipping
+  grad_clip_norm: 10.0   # Max gradient norm
+
+  # Logging and saving
+  log_freq: 100          # Log every N steps
+  save_freq_epochs: 1.0  # Save checkpoint every N epochs
+
+# Optimizer Configuration
+# -----------------------
+optimizer:
+  lr: 0.0001             # Learning rate (1e-4, higher than ACT)
+  betas: [0.9, 0.999]    # Adam betas
+  weight_decay: 0.000001 # Weight decay (1e-6)
+  eps: 0.00000001        # Adam epsilon (1e-8)
+
+# Scheduler Configuration
+# -----------------------
+scheduler:
+  num_warmup_steps: 10000     # Warmup steps (10% of total)
+  num_decay_steps: 100000     # Decay steps (matches training steps)
+  peak_lr: 0.0001             # Peak learning rate (1e-4)
+  decay_lr: 0.00001           # Final learning rate (1e-5)
+
+# Notes:
+# ------
+# 1. Diffusion Policy generates smoother trajectories than ACT
+# 2. Shorter action horizon (16 vs 100) → faster inference
+# 3. n_action_steps < horizon → temporal ensemble effect
+# 4. num_inference_steps controls quality/speed tradeoff
+#    - Training: 100 steps (high quality)
+#    - Inference: 10-20 steps (faster, slight quality loss)
+# 5. Proven effective for tight-tolerance insertion tasks
+#
+# Performance expectations:
+# - TacDiffusion: 95.7% on tight-clearance insertion
+# - Requires more training steps than ACT
+# - Slower inference than ACT (diffusion sampling)
+# - Excels at contact-rich, precise manipulation

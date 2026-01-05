@@ -53,6 +53,7 @@ class HDF5LeRobotDataset(Dataset):
         hdf5_path: str,
         episode_index: int = 0,
         horizon: int = 1,
+        n_obs_steps: int = 1,
         use_qpos: bool = False,
         use_ee_pose: bool = True,
         task_instruction: str = "Insert the needle into the target point",
@@ -64,12 +65,14 @@ class HDF5LeRobotDataset(Dataset):
         augment_saturation: float = 0.2,
         augment_hue: float = 0.05,
         augment_noise: float = 0.02,
+        squeeze_n_obs_steps: bool = False,
     ):
         """
         Args:
             hdf5_path: Path to HDF5 episode file
             episode_index: Episode index for this dataset
             horizon: Action prediction horizon (for future multi-step actions)
+            n_obs_steps: Number of observation steps (temporal stacking)
             use_qpos: Use joint positions for state (6 dims)
             use_ee_pose: Use end-effector pose for state (6 dims, default)
             task_instruction: Task instruction text
@@ -81,12 +84,15 @@ class HDF5LeRobotDataset(Dataset):
             augment_saturation: Max saturation adjustment factor
             augment_hue: Max hue adjustment (in degrees / 360)
             augment_noise: Gaussian noise std deviation
+            squeeze_n_obs_steps: Squeeze temporal dimension if n_obs_steps=1 (for ACT)
         """
         super().__init__()
 
         self.hdf5_path = Path(hdf5_path)
         self.episode_index = episode_index
         self.horizon = horizon
+        self.n_obs_steps = n_obs_steps
+        self.squeeze_n_obs_steps = squeeze_n_obs_steps
         self.use_qpos = use_qpos
         self.use_ee_pose = use_ee_pose
         self.task = task_instruction
@@ -163,8 +169,9 @@ class HDF5LeRobotDataset(Dataset):
             return False
 
     def __len__(self) -> int:
-        # Subtract horizon-1 to ensure we can always get full action sequences
-        return max(0, self.num_frames - self.horizon + 1)
+        # Subtract (n_obs_steps - 1) for temporal stacking and (horizon - 1) for action sequences
+        # We need at least n_obs_steps frames to create temporal observations
+        return max(0, self.num_frames - max(self.n_obs_steps - 1, 0) - self.horizon + 1)
 
     def apply_image_augmentation(self, img_np: np.ndarray) -> np.ndarray:
         """
@@ -216,12 +223,22 @@ class HDF5LeRobotDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict:
         """
-        Get a sample in LeRobot format.
+        Get a sample in LeRobot format with temporal observation stacking.
 
         Returns:
             Dictionary with LeRobot-compatible keys and values.
         """
-        # Create LeRobot sample
+        # Calculate observation frame indices (temporal stacking)
+        # For n_obs_steps=2: if idx=10, we get frames [9, 10]
+        # For n_obs_steps=1: if idx=10, we get frame [10]
+        obs_start_idx = max(0, idx - (self.n_obs_steps - 1))
+        obs_indices = list(range(obs_start_idx, idx + 1))
+
+        # Pad if we don't have enough history (at the beginning of episode)
+        while len(obs_indices) < self.n_obs_steps:
+            obs_indices.insert(0, obs_indices[0])  # Repeat first frame
+
+        # Create LeRobot sample (metadata from current frame)
         lerobot_sample = {
             # Metadata
             "task": self.task,
@@ -231,7 +248,7 @@ class HDF5LeRobotDataset(Dataset):
             "index": idx,  # Will be updated by ConcatDataset
         }
 
-        # Determine which cameras to dropout
+        # Determine which cameras to dropout (same for all temporal steps)
         active_cameras = list(range(1, self.num_cameras + 1))
         if self.camera_dropout_prob > 0 and random.random() < self.camera_dropout_prob:
             # Calculate how many cameras to keep active
@@ -239,102 +256,129 @@ class HDF5LeRobotDataset(Dataset):
             if num_to_keep < self.num_cameras:
                 active_cameras = random.sample(active_cameras, num_to_keep)
 
-        # Process images: Load from HDF5 and convert to (C, H, W) tensors
+        # Process images: Load temporal observations and stack to (n_obs_steps, C, H, W)
         for cam_idx in range(1, self.num_cameras + 1):
             cam_key = f"camera{cam_idx}"
             try:
                 # Check if this camera should be dropped out
                 if cam_idx not in active_cameras:
                     # Camera dropout: use black image
-                    lerobot_sample[f"observation.images.{cam_key}"] = torch.zeros(3, 512, 512)
+                    lerobot_sample[f"observation.images.{cam_key}"] = torch.zeros(self.n_obs_steps, 3, 512, 512)
                     continue
 
-                # Load image from HDF5
-                raw_data = self.h5file['observations']['images'][cam_key][idx]
+                # Load temporal images from HDF5
+                img_tensors = []
+                for obs_idx in obs_indices:
+                    raw_data = self.h5file['observations']['images'][cam_key][obs_idx]
 
-                # Decode based on format
-                if self.is_jpeg_format:
-                    # JPEG format: decode compressed binary
-                    if isinstance(raw_data, np.ndarray):
-                        jpeg_array = raw_data.flatten().astype(np.uint8)
-                    elif isinstance(raw_data, (bytes, bytearray)):
-                        jpeg_array = np.frombuffer(raw_data, dtype=np.uint8)
+                    # Decode based on format
+                    if self.is_jpeg_format:
+                        # JPEG format: decode compressed binary
+                        if isinstance(raw_data, np.ndarray):
+                            jpeg_array = raw_data.flatten().astype(np.uint8)
+                        elif isinstance(raw_data, (bytes, bytearray)):
+                            jpeg_array = np.frombuffer(raw_data, dtype=np.uint8)
+                        else:
+                            jpeg_array = np.array(raw_data, dtype=np.uint8).flatten()
+
+                        # Ensure contiguous array for cv2
+                        if not jpeg_array.flags['C_CONTIGUOUS']:
+                            jpeg_array = np.ascontiguousarray(jpeg_array)
+
+                        # Decode JPEG: bytes → BGR → RGB
+                        img_bgr = cv2.imdecode(jpeg_array, cv2.IMREAD_COLOR)
+                        if img_bgr is None:
+                            raise ValueError(f"Failed to decode JPEG data (size: {jpeg_array.size})")
+                        img_np = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
                     else:
-                        jpeg_array = np.array(raw_data, dtype=np.uint8).flatten()
+                        # GZIP format: already decoded RGB array
+                        img_np = raw_data
 
-                    # Ensure contiguous array for cv2
-                    if not jpeg_array.flags['C_CONTIGUOUS']:
-                        jpeg_array = np.ascontiguousarray(jpeg_array)
+                    # Verify image shape
+                    if len(img_np.shape) != 3 or img_np.shape[2] != 3:
+                        raise ValueError(f"Invalid image shape: {img_np.shape}, expected (H, W, 3)")
 
-                    # Decode JPEG: bytes → BGR → RGB
-                    img_bgr = cv2.imdecode(jpeg_array, cv2.IMREAD_COLOR)
-                    if img_bgr is None:
-                        raise ValueError(f"Failed to decode JPEG data (size: {jpeg_array.size})")
-                    img_np = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                else:
-                    # GZIP format: already decoded RGB array
-                    img_np = raw_data
+                    # Resize to 512x512 (required by SmolVLA model)
+                    img_np = cv2.resize(img_np, (512, 512), interpolation=cv2.INTER_LINEAR)
 
-                # Verify image shape
-                if len(img_np.shape) != 3 or img_np.shape[2] != 3:
-                    raise ValueError(f"Invalid image shape: {img_np.shape}, expected (H, W, 3)")
+                    # Convert to float and normalize to [0, 1]
+                    img_np = img_np.astype(np.float32) / 255.0
 
-                # Resize to 512x512 (required by SmolVLA model)
-                img_np = cv2.resize(img_np, (512, 512), interpolation=cv2.INTER_LINEAR)
+                    # Apply augmentation (only to current frame, not to history)
+                    if obs_idx == idx:
+                        img_np = self.apply_image_augmentation(img_np)
 
-                # Convert to float and normalize to [0, 1]
-                img_np = img_np.astype(np.float32) / 255.0
+                    # Convert to tensor: (H, W, C) -> (C, H, W)
+                    img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).contiguous()
+                    img_tensors.append(img_tensor)
 
-                # Apply augmentation
-                img_np = self.apply_image_augmentation(img_np)
-
-                # Convert to tensor: (H, W, C) -> (C, H, W)
-                img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).contiguous()
-
-                # Add to sample with LeRobot naming convention
-                lerobot_sample[f"observation.images.{cam_key}"] = img_tensor
+                # Stack temporal observations: list of (C, H, W) -> (n_obs_steps, C, H, W)
+                lerobot_sample[f"observation.images.{cam_key}"] = torch.stack(img_tensors, dim=0)
 
             except Exception as e:
                 logger.warning(f"Failed to load {cam_key} at frame {idx}: {e}")
-                # Create dummy image if loading fails
-                lerobot_sample[f"observation.images.{cam_key}"] = torch.zeros(3, 512, 512)
+                # Create dummy images if loading fails
+                lerobot_sample[f"observation.images.{cam_key}"] = torch.zeros(self.n_obs_steps, 3, 512, 512)
 
-        # Process robot state
-        state_parts = []
+        # Process robot state with temporal stacking
+        # Stack states to shape (n_obs_steps, state_dim)
+        state_tensors = []
+        for obs_idx in obs_indices:
+            state_parts = []
 
-        if self.use_qpos:
-            qpos = self.h5file['observations']['qpos'][idx]
-            state_parts.append(qpos)
+            if self.use_qpos:
+                qpos = self.h5file['observations']['qpos'][obs_idx]
+                state_parts.append(qpos)
 
-        if self.use_ee_pose:
-            ee_pose = self.h5file['observations']['ee_pose'][idx]
-            state_parts.append(ee_pose)
+            if self.use_ee_pose:
+                ee_pose = self.h5file['observations']['ee_pose'][obs_idx]
+                state_parts.append(ee_pose)
 
-        # Concatenate state parts
-        if len(state_parts) > 1:
-            state = np.concatenate(state_parts, axis=0)
-        else:
-            state = state_parts[0]
+            # Concatenate state parts
+            if len(state_parts) > 1:
+                state = np.concatenate(state_parts, axis=0)
+            else:
+                state = state_parts[0]
 
-        # Convert to tensor
-        lerobot_sample["observation.state"] = torch.from_numpy(state.astype(np.float32))
+            # Convert to tensor
+            state_tensor = torch.from_numpy(state.astype(np.float32))
+            state_tensors.append(state_tensor)
+
+        # Stack temporal states: list of (state_dim,) -> (n_obs_steps, state_dim)
+        lerobot_sample["observation.state"] = torch.stack(state_tensors, dim=0)
+
+        # Squeeze temporal dimension if requested (for ACT compatibility)
+        if self.squeeze_n_obs_steps and self.n_obs_steps == 1:
+            # Squeeze n_obs_steps dimension: (1, ...) -> (...)
+            for key in list(lerobot_sample.keys()):
+                if key.startswith("observation.images.") or key == "observation.state":
+                    lerobot_sample[key] = lerobot_sample[key].squeeze(0)
 
         # Process actions
         if self.horizon == 1:
             # Single-step action
             action = self.h5file['action'][idx]
             lerobot_sample["action"] = torch.from_numpy(action.astype(np.float32))
+            # No padding for single-step
+            lerobot_sample["action_is_pad"] = torch.tensor([False], dtype=torch.bool)
         else:
             # Multi-step action chunk
             end_idx = min(idx + self.horizon, self.num_frames)
             actions = self.h5file['action'][idx:end_idx]
+            original_len = actions.shape[0]
 
             # Pad if necessary
             if actions.shape[0] < self.horizon:
                 padding = np.repeat(actions[-1:], self.horizon - actions.shape[0], axis=0)
                 actions = np.concatenate([actions, padding], axis=0)
 
+            # Create action_is_pad mask
+            action_is_pad = torch.zeros(self.horizon, dtype=torch.bool)
+            if original_len < self.horizon:
+                action_is_pad[original_len:] = True  # Mark padded indices as True
+
             lerobot_sample["action"] = torch.from_numpy(actions.astype(np.float32))
+            lerobot_sample["action_is_pad"] = action_is_pad
 
         return lerobot_sample
 
@@ -350,6 +394,7 @@ class HDF5LeRobotDataset(Dataset):
 def create_hdf5_lerobot_dataset(
     hdf5_paths: List[Union[str, Path]],
     horizon: int = 1,
+    n_obs_steps: int = 1,
     use_qpos: bool = False,
     use_ee_pose: bool = True,
     task_instruction: str = "Insert the needle into the target point",
@@ -361,6 +406,7 @@ def create_hdf5_lerobot_dataset(
     augment_saturation: float = 0.2,
     augment_hue: float = 0.05,
     augment_noise: float = 0.02,
+    squeeze_n_obs_steps: bool = False,
 ) -> Dataset:
     """
     Create a combined HDF5 LeRobot dataset from multiple episodes.
@@ -368,6 +414,7 @@ def create_hdf5_lerobot_dataset(
     Args:
         hdf5_paths: List of HDF5 file paths
         horizon: Action prediction horizon
+        n_obs_steps: Number of observation steps (temporal stacking)
         use_qpos: Use joint positions for state
         use_ee_pose: Use end-effector pose for state (default)
         task_instruction: Task instruction text
@@ -379,6 +426,7 @@ def create_hdf5_lerobot_dataset(
         augment_saturation: Max saturation adjustment factor
         augment_hue: Max hue adjustment (in degrees / 360)
         augment_noise: Gaussian noise std deviation
+        squeeze_n_obs_steps: Squeeze temporal dimension if n_obs_steps=1 (for ACT)
 
     Returns:
         Combined dataset (ConcatDataset if multiple episodes)
@@ -399,6 +447,7 @@ def create_hdf5_lerobot_dataset(
                 hdf5_path=str(file_path),
                 episode_index=episode_idx,
                 horizon=horizon,
+                n_obs_steps=n_obs_steps,
                 use_qpos=use_qpos,
                 use_ee_pose=use_ee_pose,
                 task_instruction=task_instruction,
@@ -410,6 +459,7 @@ def create_hdf5_lerobot_dataset(
                 augment_saturation=augment_saturation,
                 augment_hue=augment_hue,
                 augment_noise=augment_noise,
+                squeeze_n_obs_steps=squeeze_n_obs_steps,
             )
             datasets.append(dataset)
         except Exception as e:
