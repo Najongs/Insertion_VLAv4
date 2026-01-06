@@ -145,7 +145,7 @@ class RtSampler(threading.Thread):
 
 # 🔥 OPTIMIZED: Sensor settings (100ms window)
 SENSOR_ENABLED = True
-SENSOR_TEMPORAL_LENGTH = 65  # 100ms at 650Hz (was 650)
+SENSOR_TEMPORAL_LENGTH = 70  # 100ms at 700Hz
 SENSOR_INPUT_CHANNELS = 1026  # 1 force + 1025 A-scan
 
 # Network settings
@@ -163,13 +163,14 @@ SENSOR_TOTAL_PACKET_SIZE = SENSOR_PACKET_HEADER_SIZE + SENSOR_ALINE_SIZE
 SENSOR_CALIBRATION_COUNT = 50
 
 class OCT_FPI_sampler:
-    def __init__(self, max_length=65, channels=1026, save_buffer=None):
+    def __init__(self, max_length=70, channels=1026, save_buffer=None):
         self.max_length = max_length
         self.channels = channels
         self.buffer = deque(maxlen=max_length)
         self.save_buffer = save_buffer  # Optional: list to save all data
         self.lock = threading.Lock()
         self.inference_started = False  # 녹화 시작 여부
+        self.latest_force = 0.0  # 최신 force 값
 
     def add_samples(self, samples: list):
         """Add multiple samples (from UDP batch)"""
@@ -179,6 +180,9 @@ class OCT_FPI_sampler:
                 aline = sample['aline'].astype(np.float32)
                 combined = np.concatenate([force, aline])  # (1026,)
                 self.buffer.append(combined)
+
+                # Update latest force value
+                self.latest_force = sample['force']
 
                 # Save to permanent buffer only after inference has started
                 if self.save_buffer is not None and self.inference_started:
@@ -218,10 +222,23 @@ class OCT_FPI_sampler:
                 padding = np.zeros((pad_length, self.channels), dtype=np.float32)
                 data = np.concatenate([padding, data], axis=0)
 
-            return data  # (65, 1026)
+            return data  # (70, 1026)
+
+    def get_status(self):
+        """Get sensor status information for display"""
+        with self.lock:
+            return {
+                'buffer_size': len(self.buffer),
+                'max_length': self.max_length,
+                'latest_force': self.latest_force,
+                'recording': self.inference_started
+            }
 
 class SensorUDPReceiver(threading.Thread):
-    """Receives sensor data via UDP and updates circular buffer"""
+    """
+    Receives INDIVIDUAL sensor packets (4120 bytes) via UDP.
+    Compatible with C++ Sender (Batch Size = 1)
+    """
     def __init__(self, sensor_buffer, stop_event):
         super().__init__(daemon=True)
         self.sensor_buffer = sensor_buffer
@@ -229,13 +246,24 @@ class SensorUDPReceiver(threading.Thread):
         self.clock_offset = None
         self.calibration_samples = []
         self.packet_count = 0
+        self.packets_per_second = 0.0
+        self.last_rate_update = time.time()
+        self.packets_since_last_update = 0
+        self.lock = threading.Lock()
+        self.last_packet_time = time.time()  # 마지막 패킷 수신 시간
+
+        # C++ 구조체 설정 (DataPacket)
+        # 4120 bytes = 8(double) + 8(double) + 4(float) + 4*1025(float array)
+        self.PACKET_SIZE = 4120
+        self.PACKET_FORMAT = '<ddf1025f' 
 
     def run(self):
         import socket
+        import struct
 
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SENSOR_BUFFER_SIZE)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
             sock.bind((SENSOR_UDP_IP, SENSOR_UDP_PORT))
             sock.settimeout(1.0)
             logger.info(f"✅ Sensor UDP Receiver started on port {SENSOR_UDP_PORT}")
@@ -243,11 +271,10 @@ class SensorUDPReceiver(threading.Thread):
             logger.error(f"❌ Failed to bind UDP socket: {e}")
             return
 
-        logger.info(f"⏳ Calibrating sensor clock offset (first {SENSOR_CALIBRATION_COUNT} batches)...")
-
         while not self.stop_event.is_set():
             try:
-                data, addr = sock.recvfrom(SENSOR_BUFFER_SIZE)
+                # 1. 패킷 크기를 넉넉하게 잡고 수신
+                data, addr = sock.recvfrom(4200) 
             except socket.timeout:
                 continue
             except Exception as e:
@@ -255,61 +282,152 @@ class SensorUDPReceiver(threading.Thread):
                     logger.debug(f"[UDP Sensor] Receive error: {e}")
                 continue
 
-            recv_time = time.time()
-
-            if len(data) < SENSOR_TOTAL_PACKET_SIZE:
+            # 2. 크기 검증: 정확히 4120 바이트여야 함
+            if len(data) != self.PACKET_SIZE:
                 continue
 
             try:
-                # Parse batch header
-                num_packets = struct.unpack('<I', data[:4])[0]
-                expected_size = 4 + (num_packets * SENSOR_TOTAL_PACKET_SIZE)
+                # 3. 구조체 언패킹 (헤더 개수 확인 로직 삭제됨)
+                unpacked = struct.unpack(self.PACKET_FORMAT, data)
+                
+                ts = unpacked[0]
+                send_ts = unpacked[1]
+                force = unpacked[2]
+                aline = np.array(unpacked[3:], dtype=np.float32)
 
-                if len(data) != expected_size or num_packets == 0:
-                    continue
+                record = {
+                    'timestamp': ts,
+                    'send_timestamp': send_ts,
+                    'force': force,
+                    'aline': aline
+                }
 
-                # Parse packets
-                records = []
-                mv = memoryview(data)[4:]
-                offset = 0
-                last_send_ts = 0.0
+                # 4. 버퍼에 추가
+                self.sensor_buffer.add_samples([record])
 
-                for _ in range(num_packets):
-                    header = mv[offset:offset + SENSOR_PACKET_HEADER_SIZE]
-                    ts, send_ts, force = struct.unpack(SENSOR_PACKET_HEADER_FORMAT, header)
-                    offset += SENSOR_PACKET_HEADER_SIZE
+                # 통계 업데이트
+                current_time = time.time()
+                with self.lock:
+                    self.last_packet_time = current_time
+                self.packet_count += 1
+                self.packets_since_last_update += 1
 
-                    aline_bytes = mv[offset:offset + SENSOR_ALINE_SIZE]
-                    aline = np.frombuffer(aline_bytes, dtype=np.float32).copy()
-                    offset += SENSOR_ALINE_SIZE
+                # 1초마다 수신율 계산
+                if current_time - self.last_rate_update >= 1.0:
+                    with self.lock:
+                        self.packets_per_second = self.packets_since_last_update / (current_time - self.last_rate_update)
+                    self.packets_since_last_update = 0
+                    self.last_rate_update = current_time
 
-                    records.append({
-                        'timestamp': ts,
-                        'send_timestamp': send_ts,
-                        'force': force,
-                        'aline': aline
-                    })
-                    last_send_ts = send_ts
-
-                # Clock calibration
+                # Clock calibration (처음 50개만)
                 if self.clock_offset is None:
-                    net_plus_offset = recv_time - last_send_ts
-                    self.calibration_samples.append(net_plus_offset)
-
-                    if len(self.calibration_samples) >= SENSOR_CALIBRATION_COUNT:
+                    recv_time = time.time()
+                    self.calibration_samples.append(recv_time - send_ts)
+                    if len(self.calibration_samples) >= 50:
                         self.clock_offset = np.mean(self.calibration_samples)
                         logger.info(f"\n✅ Sensor Clock Offset Calibrated: {self.clock_offset * 1000:.1f} ms\n")
 
-                # Add to circular buffer
-                self.sensor_buffer.add_samples(records)
-                self.packet_count += num_packets
-
             except Exception as e:
-                logger.error(f"[ERROR] Sensor UDP unpack failed: {e}")
+                logger.error(f"Unpack failed: {e}")
                 continue
 
         sock.close()
         logger.info("🛑 Sensor UDP Receiver stopped")
+
+    def get_stats(self):
+        """Get receiver statistics"""
+        with self.lock:
+            time_since_last = time.time() - self.last_packet_time
+            return {
+                'total_packets': self.packet_count,
+                'packets_per_second': self.packets_per_second,
+                'calibrated': self.clock_offset is not None,
+                'is_receiving': time_since_last < 2.0  # 2초 이내에 데이터 받았는지
+            }
+
+# ============================================================
+# 2.5️⃣ Sensor Visualization
+# ============================================================
+def visualize_sensor_data(sensor_sampler):
+    """
+    Create visualization window for sensor data
+    - OCT M-mode image (top)
+    - FPI force graph (bottom)
+    """
+    if sensor_sampler is None:
+        return None
+
+    with sensor_sampler.lock:
+        if len(sensor_sampler.buffer) == 0:
+            return None
+
+        # Extract data from circular buffer
+        buffer_data = list(sensor_sampler.buffer)
+
+        # Extract force and aline data
+        forces = np.array([sample[0] for sample in buffer_data])  # First channel is force
+        alines = np.array([sample[1:] for sample in buffer_data])  # Remaining 1025 channels
+
+    # === 1. OCT M-mode Image ===
+    # Transpose to get (Depth, Time) for image display
+    mmode_img = alines.T  # (1025, T) where T <= 70
+
+    # Normalize to 0-255 for display
+    if mmode_img.max() > mmode_img.min():
+        mmode_normalized = ((mmode_img - mmode_img.min()) / (mmode_img.max() - mmode_img.min()) * 255).astype(np.uint8)
+    else:
+        mmode_normalized = np.zeros_like(mmode_img, dtype=np.uint8)
+
+    # Convert to BGR for consistency with OpenCV (grayscale)
+    mmode_gray = cv2.cvtColor(mmode_normalized, cv2.COLOR_GRAY2BGR)
+
+    # Resize for better visibility (width x4 to see time progression, height 400)
+    mmode_display = cv2.resize(mmode_gray, (mmode_gray.shape[1] * 4, 400))
+
+    # Add label
+    cv2.putText(mmode_display, "OCT M-mode (Grayscale)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(mmode_display, f"Depth: {alines.shape[1]} | Frames: {len(buffer_data)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+    # === 2. FPI Force Graph ===
+    graph_width = mmode_display.shape[1]
+    graph_height = 200
+    graph_img = np.zeros((graph_height, graph_width, 3), dtype=np.uint8)
+
+    # Normalize force values for display
+    if len(forces) > 1:
+        force_min, force_max = forces.min(), forces.max()
+        if force_max > force_min:
+            forces_norm = (forces - force_min) / (force_max - force_min)
+        else:
+            forces_norm = np.zeros_like(forces)
+
+        # Draw force graph
+        x_step = graph_width / len(forces)
+        points = []
+        for i, f in enumerate(forces_norm):
+            x = int(i * x_step)
+            y = int(graph_height - 50 - f * (graph_height - 100))  # Leave margin
+            points.append((x, y))
+
+        # Draw line
+        if len(points) > 1:
+            for i in range(len(points) - 1):
+                cv2.line(graph_img, points[i], points[i+1], (0, 255, 0), 2)
+
+    # Add label and value
+    cv2.putText(graph_img, "FPI Force", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    if len(forces) > 0:
+        cv2.putText(graph_img, f"Current: {forces[-1]:.3f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(graph_img, f"Min: {forces.min():.3f}  Max: {forces.max():.3f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+    # Draw axes
+    cv2.line(graph_img, (50, graph_height - 50), (graph_width - 20, graph_height - 50), (100, 100, 100), 1)  # X-axis
+    cv2.line(graph_img, (50, 50), (50, graph_height - 50), (100, 100, 100), 1)  # Y-axis
+
+    # === 3. Combine vertically ===
+    combined = np.vstack([mmode_display, graph_img])
+
+    return combined
 
 # ============================================================
 # 3️⃣ Gamepad Controller (Added D-Pad Support & Multi-Mode)
@@ -848,9 +966,47 @@ def main():
                         smooth_col = (0, 255, 255) if gp.smoothing_enabled else (128, 128, 128)
                         cv2.putText(combined_view, smooth_txt, (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, smooth_col, 2)
 
+                        # Sensor status display
+                        if SENSOR_ENABLED and sensor_sampler and sensor_receiver:
+                            sensor_status = sensor_sampler.get_status()
+                            receiver_stats = sensor_receiver.get_stats()
+
+                            # Connection status
+                            if not receiver_stats['is_receiving']:
+                                conn_txt = "Sensor: NO DATA"
+                                conn_col = (0, 0, 255)  # Red
+                            elif receiver_stats['calibrated']:
+                                conn_txt = "Sensor: CONNECTED"
+                                conn_col = (0, 255, 0)  # Green
+                            else:
+                                conn_txt = "Sensor: CALIBRATING..."
+                                conn_col = (0, 165, 255)  # Orange
+                            cv2.putText(combined_view, conn_txt, (20, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6, conn_col, 2)
+
+                            # Packet rate
+                            rate_txt = f"Rate: {receiver_stats['packets_per_second']:.0f} pkt/s"
+                            cv2.putText(combined_view, rate_txt, (20, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                            # Buffer status
+                            buffer_txt = f"Buffer: {sensor_status['buffer_size']}/{sensor_status['max_length']}"
+                            cv2.putText(combined_view, buffer_txt, (20, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                            # Force value
+                            force_txt = f"Force: {sensor_status['latest_force']:.3f}"
+                            cv2.putText(combined_view, force_txt, (20, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
                         cv2.imshow("Multi-View Dashboard", combined_view)
                     except Exception as e:
                         logger.error(f"GUI display error: {e}")
+
+            # 5. Sensor Visualization (Separate Window)
+            if SENSOR_ENABLED and sensor_sampler:
+                try:
+                    sensor_vis = visualize_sensor_data(sensor_sampler)
+                    if sensor_vis is not None:
+                        cv2.imshow("Sensor Data (OCT + FPI)", sensor_vis)
+                except Exception as e:
+                    logger.debug(f"Sensor visualization error: {e}")
 
             if cv2.waitKey(1) == ord('q'): break
             
