@@ -5,9 +5,28 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from datetime import datetime
 import sys
+import os
+import argparse
+
+# Constants
+DEFAULT_DATASET_DIR = "./collected_data"
+INFO_BOARD_HEIGHT = 100
+VIDEO_SCALE_THRESHOLD = 1920
+VIDEO_SCALE_FACTOR = 0.6
+VIDEO_FPS = 15  # Should match CONTROL_FREQUENCY in Robot_action.py
+PLOT_DPI = 150
+PROGRESS_UPDATE_INTERVAL = 50
+
 
 def save_sensor_plots(force_data, aline_data, output_path):
-    """센서 데이터(Force + A-line) 시각화를 이미지 파일로 저장"""
+    """
+    Save sensor data (Force + A-line) visualization as an image file.
+
+    Args:
+        force_data: Force sensor data array
+        aline_data: A-line (OCT) sensor data array
+        output_path: Path to save the plot image
+    """
     print(f"📊 센서 데이터 그래프를 생성합니다: {output_path}")
     print(f"  Force shape: {force_data.shape}, A-line shape: {aline_data.shape}")
 
@@ -37,13 +56,21 @@ def save_sensor_plots(force_data, aline_data, output_path):
     cbar = fig.colorbar(im, ax=ax2, label='Intensity')
 
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path, dpi=PLOT_DPI, bbox_inches='tight')
     plt.close()
     print(f"✅ 센서 그래프가 저장되었습니다: {output_path}")
 
 
 def save_plots(actions, qpos, ee_pose, output_path):
-    """데이터 그래프를 이미지 파일로 저장"""
+    """
+    Save robot state data plots as an image file.
+
+    Args:
+        actions: Action commands array (joystick input)
+        qpos: Joint positions array
+        ee_pose: End-effector pose array (position + orientation)
+        output_path: Path to save the plot image
+    """
     print(f"📊 그래프를 생성하여 저장합니다: {output_path}")
 
     # 데이터 검증
@@ -114,13 +141,25 @@ def save_plots(actions, qpos, ee_pose, output_path):
     ax4.set_xlabel("Time Steps")
 
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path, dpi=PLOT_DPI, bbox_inches='tight')
     plt.close()
     print(f"✅ 그래프가 저장되었습니다: {output_path}")
 
 
 def save_video_and_plots(file_path, output_dir=None):
-    """데이터셋의 영상과 그래프를 파일로 저장"""
+    """
+    Save video and plots from HDF5 dataset file.
+
+    This function processes an HDF5 dataset file containing robot teleoperation data
+    and generates:
+    1. Video combining all camera views with info overlay
+    2. Robot state plots (actions, joint positions, end-effector pose)
+    3. Sensor data plots (force, A-line) if available
+
+    Args:
+        file_path: Path to HDF5 dataset file
+        output_dir: Output directory (default: ./saved_outputs)
+    """
     print(f"📂 Loading Dataset: {file_path}")
 
     # 출력 디렉토리 설정
@@ -170,48 +209,110 @@ def save_video_and_plots(file_path, output_dir=None):
             print(f"📷 Cameras: {cam_keys}")
             print(f"⏱️ Total Steps: {total_steps}")
 
-            # 영상 데이터 메모리 로드
-            print("📥 Loading video frames to memory...")
+            # 영상 데이터 메모리 로드 및 디코딩
+            print("📥 Loading and decoding video frames to memory...")
             video_streams = {}
             for cam in cam_keys:
-                video_streams[cam] = images_grp[cam][:]
+                compressed_frames = images_grp[cam][:]
+
+                # 첫 프레임으로 형식 확인
+                first_frame = compressed_frames[0]
+                decoded_first = cv2.imdecode(first_frame, cv2.IMREAD_COLOR)
+
+                if decoded_first is not None:
+                    # JPEG 압축된 데이터
+                    print(f"  {cam}: JPEG 압축 형식 감지, 디코딩 중...")
+                    frames = []
+                    for i, comp_frame in enumerate(compressed_frames):
+                        decoded = cv2.imdecode(comp_frame, cv2.IMREAD_COLOR)
+                        # BGR to RGB 변환
+                        decoded_rgb = cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB)
+                        frames.append(decoded_rgb)
+                    video_streams[cam] = np.array(frames)
+                    print(f"    ✅ {len(frames)} 프레임 디코딩 완료, shape: {video_streams[cam].shape}")
+                else:
+                    # Raw 픽셀 데이터 (기존 방식)
+                    print(f"  {cam}: Raw 픽셀 데이터 형식")
+                    video_streams[cam] = compressed_frames
 
             # --- 2. 비디오 저장 ---
             print(f"\n🎬 비디오를 저장합니다: {video_path}")
 
-            # 첫 프레임으로 비디오 설정 초기화
+            # 첫 프레임으로 비디오 설정 초기화 및 크기 확인
             first_frames = []
+            frame_shapes = []
             for cam in cam_keys:
-                frame = cv2.cvtColor(video_streams[cam][0], cv2.COLOR_RGB2BGR)
+                # 이미 RGB로 디코딩된 이미지를 BGR로 변환
+                frame_rgb = video_streams[cam][0]
+                frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                frame_shapes.append(frame.shape)
                 first_frames.append(frame)
 
-            combined_sample = np.hstack(first_frames)
+            # 각 카메라의 해상도 출력
+            print(f"📐 카메라 해상도:")
+            for i, (cam, shape) in enumerate(zip(cam_keys, frame_shapes)):
+                print(f"  {cam}: {shape}")
+
+            # 모든 프레임이 같은 크기인지 확인
+            need_resize = len(set([s[:2] for s in frame_shapes])) > 1
+
+            if not need_resize:
+                # 모든 프레임이 같은 크기
+                print(f"  ✅ 모든 카메라 해상도 동일: {frame_shapes[0][:2]}")
+                target_height = None  # resize 불필요
+                combined_sample = np.hstack(first_frames)
+            else:
+                # 크기가 다르면 최소 높이로 통일
+                target_height = min(shape[0] for shape in frame_shapes)
+                print(f"  ⚠️ 해상도 불일치 감지, 목표 높이로 통일: {target_height}px")
+
+                # 첫 프레임들을 목표 높이로 resize
+                resized_first_frames = []
+                for frame, shape in zip(first_frames, frame_shapes):
+                    if shape[0] != target_height:
+                        # 비율 유지하면서 높이 맞추기
+                        aspect_ratio = shape[1] / shape[0]
+                        new_width = int(target_height * aspect_ratio)
+                        resized_frame = cv2.resize(frame, (new_width, target_height))
+                        resized_first_frames.append(resized_frame)
+                    else:
+                        resized_first_frames.append(frame)
+
+                combined_sample = np.hstack(resized_first_frames)
+
             h, w, _ = combined_sample.shape
-            info_board_height = 100
+            info_board_height = INFO_BOARD_HEIGHT
             total_height = h + info_board_height
 
             # 해상도 조정 (너무 크면 줄이기)
             scale = 1.0
-            if w > 1920:
-                scale = 0.6
+            if w > VIDEO_SCALE_THRESHOLD:
+                scale = VIDEO_SCALE_FACTOR
                 w = int(w * scale)
                 total_height = int(total_height * scale)
 
             # VideoWriter 초기화
-            # FPS 설정: Robot_action.py의 CONTROL_FREQUENCY와 동일하게 설정
-            fps = 15  # 데이터 수집 FPS와 동일 (Robot_action.py:32)
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(str(video_path), fourcc, fps, (w, total_height))
-            print(f"  FPS 설정: {fps}")
+            out = cv2.VideoWriter(str(video_path), fourcc, VIDEO_FPS, (w, total_height))
+            print(f"  FPS 설정: {VIDEO_FPS}")
 
             # 모든 프레임 처리
             for i in range(total_steps):
-                if i % 50 == 0:
+                if i % PROGRESS_UPDATE_INTERVAL == 0:
                     print(f"  Progress: {i}/{total_steps} frames")
 
                 frames = []
                 for cam in cam_keys:
-                    frame = cv2.cvtColor(video_streams[cam][i], cv2.COLOR_RGB2BGR)
+                    # 이미 RGB로 디코딩된 이미지를 BGR로 변환
+                    frame_rgb = video_streams[cam][i]
+                    frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+                    # 높이를 target_height로 맞추기 (필요한 경우에만)
+                    if need_resize and target_height is not None and frame.shape[0] != target_height:
+                        aspect_ratio = frame.shape[1] / frame.shape[0]
+                        new_width = int(target_height * aspect_ratio)
+                        frame = cv2.resize(frame, (new_width, target_height))
+
                     cv2.putText(frame, f"{cam}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
                     frames.append(frame)
 
@@ -267,10 +368,14 @@ def save_video_and_plots(file_path, output_dir=None):
 
 def visualize_sensor_data(npz_file):
     """
-    .npz 파일에 저장된 센서 데이터를 시각화합니다.
+    Visualize sensor data stored in .npz file.
 
-    - force 데이터는 선 그래프로 표시합니다.
-    - aline (fpi) 데이터는 2D 이미지로 표시합니다.
+    Args:
+        npz_file: Path to .npz file containing 'forces' and 'alines' arrays
+
+    The function creates a visualization with:
+    - Force data as a line plot
+    - A-line (FPI) data as a 2D image
     """
     try:
         # 데이터 로드
@@ -319,22 +424,70 @@ def visualize_sensor_data(npz_file):
     print(f"시각화 결과를 '{output_filename}' 파일로 저장했습니다.")
     plt.close()
 
-if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        npz_file_path = sys.argv[1]
-        visualize_sensor_data(npz_file_path)
+def main():
+    """Main function to handle command-line arguments and process dataset files."""
+    parser = argparse.ArgumentParser(
+        description="Save video and plots from HDF5 dataset files.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Process a specific file
+  python Save_video_and_plots.py /path/to/episode_20260106_162518.h5
+
+  # Process a specific file with custom output directory
+  python Save_video_and_plots.py /path/to/episode.h5 --output-dir ./my_output
+
+  # Process the most recent file in default directory
+  python Save_video_and_plots.py
+        """
+    )
+
+    parser.add_argument(
+        'file_path',
+        nargs='?',
+        type=str,
+        help='Path to HDF5 dataset file (if not provided, processes the most recent file)'
+    )
+
+    parser.add_argument(
+        '-o', '--output-dir',
+        type=str,
+        default=None,
+        help='Output directory for saved files (default: ./saved_outputs)'
+    )
+
+    args = parser.parse_args()
+
+    # Determine which file to process
+    if args.file_path:
+        # User provided a file path
+        file_path = Path(args.file_path)
+        if not file_path.exists():
+            print(f"❌ Error: File not found: {file_path}")
+            sys.exit(1)
+        if not file_path.suffix == '.h5':
+            print(f"❌ Error: File must be an HDF5 file (.h5): {file_path}")
+            sys.exit(1)
+        print(f"📌 처리할 파일: {file_path}")
     else:
-        print("사용법: python visualize_sensor.py <.npz 파일 경로>")
+        # Find the most recent file in default directory
+        dataset_dir = Path(DEFAULT_DATASET_DIR)
+        if not dataset_dir.exists():
+            print(f"❌ Error: Dataset directory not found: {dataset_dir}")
+            sys.exit(1)
 
+        files = sorted(dataset_dir.glob("*.h5"), key=lambda f: f.stat().st_mtime, reverse=True)
+
+        if not files:
+            print(f"⚠️ No dataset files (.h5) found in {dataset_dir}")
+            sys.exit(1)
+
+        file_path = files[0]
+        print(f"📌 가장 최근 파일을 처리합니다: {file_path.name}")
+
+    # Process the file
+    save_video_and_plots(file_path, output_dir=args.output_dir)
 
 
 if __name__ == "__main__":
-    # 가장 최근 파일 자동 로드
-    dataset_dir = Path("./collected_data")
-    files = sorted(dataset_dir.glob("*.h5"), key=lambda f: f.stat().st_mtime, reverse=True)
-
-    if not files:
-        print("⚠️ No dataset files (.h5) found!")
-    else:
-        print(f"📌 처리할 파일: {files[0].name}")
-        save_video_and_plots(files[0])
+    main()
