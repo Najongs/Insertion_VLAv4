@@ -18,6 +18,8 @@ from termcolor import colored
 import contextlib
 import cv2
 import queue
+import struct
+from collections import deque
 
 import pygame
 import depthai as dai
@@ -38,7 +40,7 @@ SCALE_ROT = 0.3   # 회전 속도
 DEADZONE = 0.2    # 노이즈 제거
 
 # 초기 위치 (Safe Start Pose)
-HOME_JOINTS = (0, -20, 20, 0, 30, 60)
+HOME_JOINTS = (30, -20, 20, 0, 30, 60)
 
 init_logging()
 logger = logging.getLogger(__name__)
@@ -136,6 +138,178 @@ class RtSampler(threading.Thread):
             if next_t - time.time() > 0: time.sleep(next_t - time.time())
 
         logger.info(f"📊 RtSampler stats: {success_count} success, {fail_count} failures")
+
+# ============================================================
+# OCT & FPI sensor Data
+# ============================================================
+
+# 🔥 OPTIMIZED: Sensor settings (100ms window)
+SENSOR_ENABLED = True
+SENSOR_TEMPORAL_LENGTH = 65  # 100ms at 650Hz (was 650)
+SENSOR_INPUT_CHANNELS = 1026  # 1 force + 1025 A-scan
+
+# Network settings
+SENSOR_UDP_PORT = 9999
+SENSOR_UDP_IP = "0.0.0.0"
+SENSOR_BUFFER_SIZE = 4 * 1024 * 1024
+
+# Sensor packet format
+SENSOR_NXZRt = 1025
+SENSOR_PACKET_HEADER_FORMAT = '<ddf'  # ts, send_ts, force
+SENSOR_PACKET_HEADER_SIZE = struct.calcsize(SENSOR_PACKET_HEADER_FORMAT)
+SENSOR_ALINE_FORMAT = f'<{SENSOR_NXZRt}f'
+SENSOR_ALINE_SIZE = struct.calcsize(SENSOR_ALINE_FORMAT)
+SENSOR_TOTAL_PACKET_SIZE = SENSOR_PACKET_HEADER_SIZE + SENSOR_ALINE_SIZE
+SENSOR_CALIBRATION_COUNT = 50
+
+class OCT_FPI_sampler:
+    def __init__(self, max_length=65, channels=1026, save_buffer=None):
+        self.max_length = max_length
+        self.channels = channels
+        self.buffer = deque(maxlen=max_length)
+        self.save_buffer = save_buffer  # Optional: list to save all data
+        self.lock = threading.Lock()
+        self.inference_started = False  # 녹화 시작 여부
+
+    def add_samples(self, samples: list):
+        """Add multiple samples (from UDP batch)"""
+        with self.lock:
+            for sample in samples:
+                force = np.array([sample['force']], dtype=np.float32)
+                aline = sample['aline'].astype(np.float32)
+                combined = np.concatenate([force, aline])  # (1026,)
+                self.buffer.append(combined)
+
+                # Save to permanent buffer only after inference has started
+                if self.save_buffer is not None and self.inference_started:
+                    self.save_buffer.append({
+                        'timestamp': sample['timestamp'],
+                        'send_timestamp': sample['send_timestamp'],
+                        'force': sample['force'],
+                        'aline': sample['aline']
+                    })
+
+    def start_recording(self):
+        """녹화 시작 - 이후 수신되는 데이터는 save_buffer에 저장됨"""
+        with self.lock:
+            self.inference_started = True
+            if self.save_buffer is not None:
+                self.save_buffer.clear()
+        logger.info("🔴 Sensor recording started")
+
+    def stop_recording(self):
+        """녹화 종료"""
+        with self.lock:
+            self.inference_started = False
+        logger.info("⏹️ Sensor recording stopped")
+
+    def get_tensor(self):
+        """Get current buffer as numpy array (T, C) with padding if needed"""
+        with self.lock:
+            if len(self.buffer) == 0:
+                # Return zeros if no data yet
+                return np.zeros((self.max_length, self.channels), dtype=np.float32)
+
+            data = np.array(list(self.buffer), dtype=np.float32)  # (current_len, C)
+
+            # Pad to max_length if needed
+            if len(data) < self.max_length:
+                pad_length = self.max_length - len(data)
+                padding = np.zeros((pad_length, self.channels), dtype=np.float32)
+                data = np.concatenate([padding, data], axis=0)
+
+            return data  # (65, 1026)
+
+class SensorUDPReceiver(threading.Thread):
+    """Receives sensor data via UDP and updates circular buffer"""
+    def __init__(self, sensor_buffer, stop_event):
+        super().__init__(daemon=True)
+        self.sensor_buffer = sensor_buffer
+        self.stop_event = stop_event
+        self.clock_offset = None
+        self.calibration_samples = []
+        self.packet_count = 0
+
+    def run(self):
+        import socket
+
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SENSOR_BUFFER_SIZE)
+            sock.bind((SENSOR_UDP_IP, SENSOR_UDP_PORT))
+            sock.settimeout(1.0)
+            logger.info(f"✅ Sensor UDP Receiver started on port {SENSOR_UDP_PORT}")
+        except Exception as e:
+            logger.error(f"❌ Failed to bind UDP socket: {e}")
+            return
+
+        logger.info(f"⏳ Calibrating sensor clock offset (first {SENSOR_CALIBRATION_COUNT} batches)...")
+
+        while not self.stop_event.is_set():
+            try:
+                data, addr = sock.recvfrom(SENSOR_BUFFER_SIZE)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if not self.stop_event.is_set():
+                    logger.debug(f"[UDP Sensor] Receive error: {e}")
+                continue
+
+            recv_time = time.time()
+
+            if len(data) < SENSOR_TOTAL_PACKET_SIZE:
+                continue
+
+            try:
+                # Parse batch header
+                num_packets = struct.unpack('<I', data[:4])[0]
+                expected_size = 4 + (num_packets * SENSOR_TOTAL_PACKET_SIZE)
+
+                if len(data) != expected_size or num_packets == 0:
+                    continue
+
+                # Parse packets
+                records = []
+                mv = memoryview(data)[4:]
+                offset = 0
+                last_send_ts = 0.0
+
+                for _ in range(num_packets):
+                    header = mv[offset:offset + SENSOR_PACKET_HEADER_SIZE]
+                    ts, send_ts, force = struct.unpack(SENSOR_PACKET_HEADER_FORMAT, header)
+                    offset += SENSOR_PACKET_HEADER_SIZE
+
+                    aline_bytes = mv[offset:offset + SENSOR_ALINE_SIZE]
+                    aline = np.frombuffer(aline_bytes, dtype=np.float32).copy()
+                    offset += SENSOR_ALINE_SIZE
+
+                    records.append({
+                        'timestamp': ts,
+                        'send_timestamp': send_ts,
+                        'force': force,
+                        'aline': aline
+                    })
+                    last_send_ts = send_ts
+
+                # Clock calibration
+                if self.clock_offset is None:
+                    net_plus_offset = recv_time - last_send_ts
+                    self.calibration_samples.append(net_plus_offset)
+
+                    if len(self.calibration_samples) >= SENSOR_CALIBRATION_COUNT:
+                        self.clock_offset = np.mean(self.calibration_samples)
+                        logger.info(f"\n✅ Sensor Clock Offset Calibrated: {self.clock_offset * 1000:.1f} ms\n")
+
+                # Add to circular buffer
+                self.sensor_buffer.add_samples(records)
+                self.packet_count += num_packets
+
+            except Exception as e:
+                logger.error(f"[ERROR] Sensor UDP unpack failed: {e}")
+                continue
+
+        sock.close()
+        logger.info("🛑 Sensor UDP Receiver stopped")
 
 # ============================================================
 # 3️⃣ Gamepad Controller (Added D-Pad Support & Multi-Mode)
@@ -310,8 +484,8 @@ class OAKCameraManager:
             # 카메라 ID가 19로 시작하면 수동 초점 설정
             camera_id = info.getMxId()
             if camera_id.startswith("19"):
-                c.initialControl.setManualFocus(105)
-                logger.info(f"📷 Camera {camera_id}: Manual focus set to 105")
+                c.initialControl.setManualFocus(101)
+                logger.info(f"📷 Camera {camera_id}: Manual focus set to 101")
             else:
                 logger.info(f"📷 Camera {camera_id}: Auto focus")
 
@@ -330,11 +504,12 @@ class OAKCameraManager:
     def close(self): self.stack.close()
 
 class VLARecorder:
-    def __init__(self, output_dir, clock):
+    def __init__(self, output_dir, clock, sensor_buffer=None):
         self.out = pathlib.Path(output_dir)
         self.out.mkdir(parents=True, exist_ok=True)
         self.clock = clock
         self.buffer = []
+        self.sensor_buffer = sensor_buffer  # OCT_FPI_sampler 인스턴스
         self.recording = False
         self.is_saving = False # 현재 저장 중인지 확인하는 플래그
 
@@ -344,6 +519,11 @@ class VLARecorder:
             return
         self.buffer = []
         self.recording = True
+
+        # 센서 녹화 시작
+        if self.sensor_buffer is not None:
+            self.sensor_buffer.start_recording()
+
         logger.info("🎥 STARTED Recording")
 
     def add(self, frames, q, p, action):
@@ -356,15 +536,24 @@ class VLARecorder:
     def save_async(self):
         """백그라운드 스레드에서 저장을 수행 (메인 루프 멈춤 방지)"""
         if not self.buffer: return
-        
+
         # 1. 현재 버퍼를 임시 변수에 넘기고, 메인 버퍼는 즉시 비움 (다음 녹화 준비)
         buffer_snapshot = self.buffer
         self.buffer = []
         self.recording = False
+
+        # 센서 녹화 종료 및 데이터 복사
+        sensor_data_snapshot = None
+        if self.sensor_buffer is not None:
+            self.sensor_buffer.stop_recording()
+            with self.sensor_buffer.lock:
+                if self.sensor_buffer.save_buffer:
+                    sensor_data_snapshot = list(self.sensor_buffer.save_buffer)
+
         self.is_saving = True # 저장 시작 플래그 ON
 
         # 2. 저장 작업 정의 (별도 스레드에서 실행될 함수)
-        def worker(data, filename):
+        def worker(data, sensor_data, filename):
             try:
                 start_time = time.time()
                 logger.info(f"💾 Saving {len(data)} steps to disk... (Background)")
@@ -430,6 +619,30 @@ class VLARecorder:
                                     data=np.stack([x["ts"] for x in data]).astype(np.float32),
                                     compression="gzip", compression_opts=4, shuffle=True)
 
+                    # ✨ 센서 데이터 저장 (OCT + FPI) - float16으로 50% 용량 절감
+                    if sensor_data is not None and len(sensor_data) > 0:
+                        sensor_grp = obs.create_group("sensor")
+                        # Force 데이터 (1D array) - float16
+                        forces = np.array([s['force'] for s in sensor_data], dtype=np.float16)
+                        sensor_grp.create_dataset("force",
+                                                 data=forces,
+                                                 compression="gzip", compression_opts=4)
+
+                        # A-line 데이터 (2D array: num_samples x 1025) - float16
+                        # M-mode 이미지 생성용이므로 시간/채널 해상도 유지, 타입만 최적화
+                        alines = np.stack([s['aline'] for s in sensor_data]).astype(np.float16)
+                        sensor_grp.create_dataset("aline",
+                                                 data=alines,
+                                                 compression="gzip", compression_opts=4, shuffle=True)
+
+                        # 센서 타임스탬프 (float32 유지 - 타임스탬프 정밀도 중요)
+                        sensor_ts = np.array([s['timestamp'] for s in sensor_data], dtype=np.float32)
+                        sensor_grp.create_dataset("timestamp",
+                                                 data=sensor_ts,
+                                                 compression="gzip", compression_opts=4)
+
+                        logger.info(f"📊 Saved {len(sensor_data)} sensor samples (float16, ~50% compressed)")
+
                 duration = time.time() - start_time
                 file_size_mb = filename.stat().st_size / (1024 * 1024)
                 logger.info(colored(f"✅ Save Complete: {filename} ({duration:.1f}s, {file_size_mb:.1f} MB)", "green"))
@@ -443,15 +656,20 @@ class VLARecorder:
         # 3. 파일명 생성 및 스레드 시작
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = self.out / f"episode_{timestamp}.h5"
-        
-        t = threading.Thread(target=worker, args=(buffer_snapshot, fname))
+
+        t = threading.Thread(target=worker, args=(buffer_snapshot, sensor_data_snapshot, fname))
         t.start()
-        
+
         logger.info("⏳ Saving started in background... You can move the robot.")
 
     def discard(self):
         self.buffer = []
         self.recording = False
+
+        # 센서 녹화도 종료
+        if self.sensor_buffer is not None:
+            self.sensor_buffer.stop_recording()
+
         logger.warning("🗑️ DISCARDED")
 
 # ============================================================
@@ -463,7 +681,26 @@ def main():
     gp = GamepadController()
     if not gp.joystick: return
     cam = OAKCameraManager()
-    rec = VLARecorder(DATASET_DIR, clock)
+
+    # 센서 시스템 초기화 (옵션)
+    sensor_sampler = None
+    sensor_receiver = None
+    sensor_stop_event = None
+
+    if SENSOR_ENABLED:
+        logger.info("🔬 Initializing sensor system...")
+        sensor_save_buffer = []  # 녹화된 센서 데이터 저장용
+        sensor_sampler = OCT_FPI_sampler(
+            max_length=SENSOR_TEMPORAL_LENGTH,
+            channels=SENSOR_INPUT_CHANNELS,
+            save_buffer=sensor_save_buffer
+        )
+        sensor_stop_event = threading.Event()
+        sensor_receiver = SensorUDPReceiver(sensor_sampler, sensor_stop_event)
+        sensor_receiver.start()
+        logger.info("✅ Sensor system initialized")
+
+    rec = VLARecorder(DATASET_DIR, clock, sensor_buffer=sensor_sampler)
 
     try:
         robot = mdr.Robot()
@@ -623,6 +860,12 @@ def main():
     except KeyboardInterrupt: logger.info("Stopped.")
     except Exception as e: logger.error(e, exc_info=True)
     finally:
+        # 센서 수신기 종료
+        if sensor_stop_event is not None:
+            sensor_stop_event.set()
+        if sensor_receiver is not None:
+            sensor_receiver.join(timeout=2.0)
+
         if 'sampler' in locals(): sampler.stop(); sampler.join()
         if 'robot' in locals() and robot.IsConnected(): robot.DeactivateRobot(); robot.Disconnect()
         cam.close(); clock.stop(); cv2.destroyAllWindows()

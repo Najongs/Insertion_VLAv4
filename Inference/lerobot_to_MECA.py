@@ -52,7 +52,7 @@ TARGET_COLOR = "red point"  # Change this to target different colored insertion 
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAMERA_FPS = 30
-CAMERA_MANUAL_FOCUS = 105
+CAMERA_MANUAL_FOCUS = 101
 
 # Control Loop Configuration
 CONTROL_FREQUENCY = 8  # Hz (realistic for VLA inference, was 15 but too fast)
