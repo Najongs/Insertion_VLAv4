@@ -9,7 +9,7 @@ import torch
 import numpy as np
 import h5py
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Any
 from torch.utils.data import Dataset, ConcatDataset
 import logging
 import random
@@ -66,6 +66,8 @@ class HDF5LeRobotDataset(Dataset):
         augment_hue: float = 0.05,
         augment_noise: float = 0.02,
         squeeze_n_obs_steps: bool = False,
+        tokenizer: Optional[Any] = None,
+        tokenizer_max_length: int = 48,
     ):
         """
         Args:
@@ -85,6 +87,8 @@ class HDF5LeRobotDataset(Dataset):
             augment_hue: Max hue adjustment (in degrees / 360)
             augment_noise: Gaussian noise std deviation
             squeeze_n_obs_steps: Squeeze temporal dimension if n_obs_steps=1 (for ACT)
+            tokenizer: HuggingFace tokenizer for language conditioning (optional)
+            tokenizer_max_length: Maximum length for tokenized text
         """
         super().__init__()
 
@@ -96,6 +100,26 @@ class HDF5LeRobotDataset(Dataset):
         self.use_qpos = use_qpos
         self.use_ee_pose = use_ee_pose
         self.task = task_instruction
+
+        # Tokenizer for language conditioning
+        self.tokenizer = tokenizer
+        self.tokenizer_max_length = tokenizer_max_length
+
+        # Pre-tokenize task instruction if tokenizer is provided
+        if self.tokenizer is not None:
+            self.tokenized_task = self.tokenizer(
+                self.task,
+                max_length=self.tokenizer_max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt"
+            )
+            # Extract tokens and attention mask (remove batch dimension)
+            self.task_tokens = self.tokenized_task["input_ids"].squeeze(0)  # (max_length,)
+            self.task_attention_mask = self.tokenized_task["attention_mask"].squeeze(0)  # (max_length,)
+        else:
+            self.task_tokens = None
+            self.task_attention_mask = None
 
         # Augmentation settings
         self.camera_dropout_prob = camera_dropout_prob
@@ -380,6 +404,11 @@ class HDF5LeRobotDataset(Dataset):
             lerobot_sample["action"] = torch.from_numpy(actions.astype(np.float32))
             lerobot_sample["action_is_pad"] = action_is_pad
 
+        # Add language tokens if tokenizer is available
+        if self.task_tokens is not None:
+            lerobot_sample["observation.language.tokens"] = self.task_tokens.clone()
+            lerobot_sample["observation.language.attention_mask"] = self.task_attention_mask.clone()
+
         return lerobot_sample
 
     def __del__(self):
@@ -407,6 +436,8 @@ def create_hdf5_lerobot_dataset(
     augment_hue: float = 0.05,
     augment_noise: float = 0.02,
     squeeze_n_obs_steps: bool = False,
+    tokenizer: Optional[Any] = None,
+    tokenizer_max_length: int = 48,
 ) -> Dataset:
     """
     Create a combined HDF5 LeRobot dataset from multiple episodes.
@@ -427,6 +458,8 @@ def create_hdf5_lerobot_dataset(
         augment_hue: Max hue adjustment (in degrees / 360)
         augment_noise: Gaussian noise std deviation
         squeeze_n_obs_steps: Squeeze temporal dimension if n_obs_steps=1 (for ACT)
+        tokenizer: HuggingFace tokenizer for language conditioning (optional)
+        tokenizer_max_length: Maximum length for tokenized text
 
     Returns:
         Combined dataset (ConcatDataset if multiple episodes)
@@ -460,6 +493,8 @@ def create_hdf5_lerobot_dataset(
                 augment_hue=augment_hue,
                 augment_noise=augment_noise,
                 squeeze_n_obs_steps=squeeze_n_obs_steps,
+                tokenizer=tokenizer,
+                tokenizer_max_length=tokenizer_max_length,
             )
             datasets.append(dataset)
         except Exception as e:

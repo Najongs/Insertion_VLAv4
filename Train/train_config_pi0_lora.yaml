@@ -1,13 +1,23 @@
-# Training Configuration for π0 (Pi Zero)
-# ============================================
+# Training Configuration for π0 (Pi Zero) with LoRA
+# ===================================================
 # π0 is Physical Intelligence's flow-matching VLA model
-# Optimized for precise manipulation with visual-language conditioning
+# LoRA (Low-Rank Adaptation) enables parameter-efficient fine-tuning
+#
+# Memory Requirements:
+# - Full Fine-Tuning: > 70 GB per GPU ❌
+# - LoRA Fine-Tuning: > 22.5 GB per GPU ✅ (works on RTX 3090!)
+#
+# LoRA Benefits:
+# - Only ~2-5% of parameters trained
+# - Much lower memory usage
+# - Faster training
+# - Smaller checkpoints (100-500 MB vs 5-10 GB)
 
 # Random seed for reproducibility
 seed: 1000
 
 # Output directory for checkpoints and logs
-output_dir: "outputs/train/pi0_needle_insertion"
+output_dir: "outputs/train/pi0_lora_needle_insertion"
 
 # Dataset Configuration
 # ---------------------
@@ -37,7 +47,7 @@ dataset:
 # Policy Configuration
 # --------------------
 policy:
-  # π0 configuration
+  # π0 configuration - Using gemma_2b with LoRA for efficiency
   pretrained_model_id: null  # No pretrained model for now
 
   # Observation and action
@@ -45,10 +55,10 @@ policy:
   chunk_size: 50         # Action chunk size (action horizon)
   n_action_steps: 50     # Number of action steps to execute
 
-  # Model architecture
-  paligemma_variant: "gemma_2b"        # PaliGemma variant (gemma_300m or gemma_2b)
+  # Model architecture - gemma_2b works with LoRA on RTX 3090!
+  paligemma_variant: "gemma_2b"        # Full PaliGemma 2B (LoRA makes it fit!)
   action_expert_variant: "gemma_300m"  # Action expert variant
-  dtype: "float32"                      # Data type (bfloat16 or float32)
+  dtype: "bfloat16"                     # Data type (bfloat16 for memory efficiency)
 
   # Dimensions
   max_state_dim: 32      # Maximum state dimension (padded)
@@ -67,8 +77,34 @@ policy:
   image_resolution: [224, 224]
 
   # Training optimization
-  gradient_checkpointing: false  # Enable for memory optimization
-  compile_model: false           # Use torch.compile
+  gradient_checkpointing: true   # Enable for additional memory optimization
+  compile_model: false           # Disable torch.compile
+  tokenizer_max_length: 48       # PaliGemma tokenizer max length
+
+# LoRA Configuration
+# ------------------
+lora:
+  # LoRA rank (controls number of trainable parameters)
+  # Higher rank = more parameters = better performance but more memory
+  lora_r: 8              # Typical values: 4, 8, 16, 32
+
+  # LoRA alpha (scaling factor)
+  # Typically set to 2x the rank
+  lora_alpha: 16         # Typical: 2 * lora_r
+
+  # LoRA dropout (regularization)
+  lora_dropout: 0.05     # Typical: 0.05-0.1
+
+  # Target modules (which layers to apply LoRA)
+  # Targeting attention and MLP layers for maximum impact
+  target_modules:
+    - "q_proj"           # Query projection
+    - "v_proj"           # Value projection
+    - "k_proj"           # Key projection
+    - "o_proj"           # Output projection
+    - "gate_proj"        # MLP gate projection
+    - "up_proj"          # MLP up projection
+    - "down_proj"        # MLP down projection
 
 # Training Configuration
 # ----------------------
@@ -77,7 +113,7 @@ training:
   steps: 30000           # 30k steps (π0 typical training length)
 
   # Batch size
-  batch_size: 8          # Per-GPU batch size (effective=40 with 5 GPUs)
+  batch_size: 4          # Per-GPU batch size (effective=20 with 5 GPUs)
 
   # DataLoader settings
   shuffle: true
@@ -107,14 +143,21 @@ scheduler:
 
 # Notes:
 # ------
-# 1. π0 uses flow matching (not diffusion) for action generation
-# 2. Language conditioning enables better generalization
-# 3. PaliGemma provides strong vision-language features
-# 4. Supports multi-camera visual inputs
-# 5. Action chunks enable smooth, temporally consistent actions
+# 1. LoRA only trains ~2-5% of parameters (10-50M vs 2.5B)
+# 2. Memory usage: > 22.5 GB per GPU (fits on RTX 3090!)
+# 3. Checkpoint size: ~100-500 MB (vs 5-10 GB full model)
+# 4. Training speed: ~1-2 steps/sec (faster than full fine-tuning)
+# 5. Performance: Slightly lower than full fine-tuning but still very good
+# 6. Can train multiple LoRA adapters for different tasks
+#
+# LoRA Hyperparameter Tuning:
+# - Increase lora_r (e.g., 16, 32) for better performance (more memory)
+# - Decrease lora_r (e.g., 4) for lower memory (slightly worse performance)
+# - lora_alpha typically 2x lora_r
+# - lora_dropout 0.05-0.1 for regularization
 #
 # Performance expectations:
-# - π0 excels at generalization across tasks
-# - Strong vision-language understanding
-# - Smooth action generation via flow matching
-# - Requires sufficient GPU memory (gemma_2b is large)
+# - Similar to full fine-tuning for most tasks
+# - Excellent for task-specific fine-tuning
+# - Can merge adapters back into base model for inference
+# - Ideal for experimenting with different tasks

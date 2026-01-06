@@ -6,6 +6,7 @@ __pycache__/
 # C extensions
 .mcp.json
 
+/openai
 *.so
 /lerobot
 /.claude
@@ -211,3 +212,5 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+.mcp.json
+openpi/
