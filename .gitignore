@@ -3,6 +3,7 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+*.h5
 # C extensions
 .mcp.json
 *.mp4
