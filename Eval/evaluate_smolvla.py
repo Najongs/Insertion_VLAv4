@@ -23,6 +23,13 @@ import numpy as np
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+# W&B for experiment tracking (optional)
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 # Add Train directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "Train"))
 
@@ -425,6 +432,19 @@ def main():
         help="Save predictions to file"
     )
 
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Log results to Weights & Biases"
+    )
+
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="smolvla-meca500-insertion",
+        help="W&B project name"
+    )
+
     args = parser.parse_args()
 
     # Setup
@@ -490,6 +510,42 @@ def main():
     # Save results
     results_path = output_dir / f"eval_results_step_{checkpoint.get('step', 'unknown')}.yaml"
     save_results(metrics, results_path)
+
+    # W&B logging (optional)
+    if args.wandb and WANDB_AVAILABLE:
+        try:
+            # Initialize W&B
+            checkpoint_step = checkpoint.get('step', 'unknown')
+            wandb.init(
+                project=args.wandb_project,
+                name=f"eval_step_{checkpoint_step}",
+                tags=["evaluation", "smolvla", "meca500"],
+                config={
+                    "checkpoint_path": str(checkpoint_path),
+                    "checkpoint_step": checkpoint_step,
+                    "config_path": str(config_path),
+                }
+            )
+
+            # Log metrics
+            wandb_metrics = {}
+            for key, value in metrics.items():
+                if key.endswith("_mean"):
+                    metric_name = key.replace("_mean", "")
+                    wandb_metrics[f"eval/{metric_name}"] = value
+                elif key.endswith("_std"):
+                    metric_name = key.replace("_std", "")
+                    wandb_metrics[f"eval/{metric_name}_std"] = value
+
+            wandb.log(wandb_metrics)
+            wandb.finish()
+
+            logger.info(f"Results logged to W&B: {args.wandb_project}")
+
+        except Exception as e:
+            logger.warning(f"Failed to log to W&B: {e}")
+    elif args.wandb and not WANDB_AVAILABLE:
+        logger.warning("W&B requested but not installed. Install with: pip install wandb")
 
     logger.info("Evaluation complete!")
 

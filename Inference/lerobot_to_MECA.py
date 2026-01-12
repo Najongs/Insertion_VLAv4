@@ -67,8 +67,29 @@ ACTION_SCALE_ROT = 1.0  # No additional scaling (model output already scaled)
 
 # Time Correction: Data was collected at 15Hz, but inference runs at 8Hz
 # Model learned actions for 66.6ms steps, but we apply them for 125ms steps
+# DEPRECATED: Time scaling amplifies noise. Use temporal interpolation instead.
 # So we need to INCREASE actions proportionally: 125ms / 66.6ms = 1.875x
-TIME_SCALE = 15.0 / 8.0  # = 1.875 (data_collection_hz / inference_hz)
+ENABLE_TIME_SCALE = False  # Set to True to use legacy time scaling (NOT recommended)
+TIME_SCALE = 15.0 / 8.0 if ENABLE_TIME_SCALE else 1.0  # = 1.875 (data_collection_hz / inference_hz)
+
+# Action Normalization Configuration
+# IMPORTANT: If you know your dataset statistics, set these to the actual min/max values
+# from your training data. Otherwise, leave at None to use model output directly.
+# You can extract these using: python scripts/extract_dataset_stats.py
+DATA_ACTION_MIN = None  # Example: np.array([-2.0, -2.0, -1.0, -5.0, -5.0, -5.0])
+DATA_ACTION_MAX = None  # Example: np.array([2.0, 2.0, 1.0, 5.0, 5.0, 5.0])
+
+# Action Smoothing Configuration
+ENABLE_EMA_FILTER = True  # Enable Exponential Moving Average filter
+EMA_ALPHA = 0.2  # EMA smoothing factor (0.1-0.3 recommended, lower = smoother)
+ENABLE_TEMPORAL_ENSEMBLE = False  # Enable temporal ensemble (action chunking)
+TEMPORAL_ENSEMBLE_WEIGHTS = [0.5, 0.3, 0.2]  # Weights for temporal ensemble (most recent first)
+
+# Robot Motion Parameters
+ROBOT_BLENDING = 100  # Blending factor (0-100, higher = smoother trajectory transitions)
+ROBOT_CART_LIN_VEL = 100  # Cartesian linear velocity (mm/s)
+ROBOT_JOINT_VEL = 1  # Joint velocity (%)
+ENABLE_ACC_CTRL = True  # Enable acceleration control for smoother motion
 
 # Robot Motion Timeouts (seconds)
 MOVE_TIMEOUT = 180
@@ -80,6 +101,156 @@ ENABLE_PROFILING = True  # Show detailed timing for camera/inference/etc
 
 # Visualization
 SHOW_CAMERA_PREVIEW = True  # Show camera frames in real-time
+
+
+class ActionSmoother:
+    """Applies temporal filtering to smooth robot actions.
+
+    Implements:
+    1. Exponential Moving Average (EMA) for high-frequency noise filtering
+    2. Temporal Ensemble for action chunking
+    """
+
+    def __init__(self, action_dim: int = 6, ema_alpha: float = 0.2,
+                 temporal_ensemble_weights: Optional[List[float]] = None):
+        """
+        Args:
+            action_dim: Dimension of action space (default: 6 for 6-DOF)
+            ema_alpha: EMA smoothing factor (0.0-1.0). Lower = smoother, higher = more responsive
+            temporal_ensemble_weights: Weights for temporal ensemble (most recent first)
+        """
+        self.action_dim = action_dim
+        self.ema_alpha = ema_alpha
+        self.ema_state = None  # Stores running average
+
+        # Temporal ensemble: stores action chunks from past inferences
+        # Each entry is a list of actions predicted at that timestep
+        self.action_chunks_history = []  # List of [chunk_idx, action_chunk]
+        self.temporal_ensemble_weights = temporal_ensemble_weights or [0.5, 0.3, 0.2]
+        self.chunk_step = 0  # Current step within chunk
+
+    def reset(self):
+        """Reset filter state for new episode."""
+        self.ema_state = None
+        self.action_chunks_history = []
+        self.chunk_step = 0
+
+    def apply_ema(self, action: np.ndarray) -> np.ndarray:
+        """Apply Exponential Moving Average filter.
+
+        Args:
+            action: Raw action from policy (6-DOF)
+
+        Returns:
+            Smoothed action
+        """
+        if self.ema_state is None:
+            # Initialize with first action
+            self.ema_state = action.copy()
+            return action
+
+        # EMA formula: S_t = α * x_t + (1 - α) * S_{t-1}
+        self.ema_state = self.ema_alpha * action + (1.0 - self.ema_alpha) * self.ema_state
+        return self.ema_state.copy()
+
+    def add_action_chunk(self, action_chunk: np.ndarray):
+        """Store a new action chunk from policy prediction.
+
+        Args:
+            action_chunk: Array of shape (chunk_size, action_dim) or (action_dim,)
+        """
+        if action_chunk.ndim == 1:
+            # Single action, treat as chunk of size 1
+            action_chunk = action_chunk.reshape(1, -1)
+
+        self.action_chunks_history.append(action_chunk)
+
+        # Keep only recent chunks (window size = len(weights))
+        max_history = len(self.temporal_ensemble_weights)
+        if len(self.action_chunks_history) > max_history:
+            self.action_chunks_history.pop(0)
+
+    def get_temporal_ensemble_action(self, current_step: int) -> Optional[np.ndarray]:
+        """Get action at current_step using temporal ensemble.
+
+        For each past prediction, we look at what it predicted for current_step,
+        then compute a weighted average with more recent predictions having higher weight.
+
+        Args:
+            current_step: Global step counter
+
+        Returns:
+            Ensembled action, or None if not enough history
+        """
+        if len(self.action_chunks_history) == 0:
+            return None
+
+        actions_for_current_step = []
+        weights_for_current_step = []
+
+        # Look back through history (most recent first)
+        for i, chunk in enumerate(reversed(self.action_chunks_history)):
+            # How many steps ago was this prediction made?
+            steps_ago = i
+
+            # What index in that chunk corresponds to current_step?
+            chunk_size = len(chunk)
+            chunk_start_step = current_step - steps_ago
+            index_in_chunk = current_step - chunk_start_step
+
+            if 0 <= index_in_chunk < chunk_size:
+                # This chunk has a prediction for current_step
+                actions_for_current_step.append(chunk[index_in_chunk])
+
+                # Assign weight (more recent = higher weight)
+                if i < len(self.temporal_ensemble_weights):
+                    weights_for_current_step.append(self.temporal_ensemble_weights[i])
+                else:
+                    # Beyond defined weights, use small weight
+                    weights_for_current_step.append(0.1)
+
+        if len(actions_for_current_step) == 0:
+            return None
+
+        # Normalize weights
+        actions_array = np.array(actions_for_current_step)
+        weights_array = np.array(weights_for_current_step)
+        weights_array = weights_array / weights_array.sum()
+
+        # Weighted average
+        ensembled_action = np.sum(actions_array * weights_array[:, np.newaxis], axis=0)
+        return ensembled_action
+
+    def smooth(self, action: np.ndarray, enable_ema: bool = True,
+               enable_temporal_ensemble: bool = False,
+               action_chunk: Optional[np.ndarray] = None,
+               current_step: int = 0) -> np.ndarray:
+        """Apply smoothing filters to action.
+
+        Args:
+            action: Raw action from policy (current timestep action)
+            enable_ema: Whether to apply EMA filter
+            enable_temporal_ensemble: Whether to apply temporal ensemble
+            action_chunk: Full action chunk from policy (for temporal ensemble)
+            current_step: Global step counter (for temporal ensemble)
+
+        Returns:
+            Smoothed action
+        """
+        smoothed_action = action.copy()
+
+        # Apply temporal ensemble first (if enabled and chunk available)
+        if enable_temporal_ensemble and action_chunk is not None:
+            self.add_action_chunk(action_chunk)
+            ensemble_action = self.get_temporal_ensemble_action(current_step)
+            if ensemble_action is not None:
+                smoothed_action = ensemble_action
+
+        # Then apply EMA
+        if enable_ema:
+            smoothed_action = self.apply_ema(smoothed_action)
+
+        return smoothed_action
 
 
 class OAKCameraManager:
@@ -249,10 +420,21 @@ class RobotManager:
         self.robot.WaitHomed()
 
         # Configure for Cartesian movements
-        self.robot.SetCartLinVel(100)
-        self.robot.SetJointVel(1)
-        self.robot.SetBlending(50)
+        self.robot.SetCartLinVel(ROBOT_CART_LIN_VEL)
+        self.robot.SetJointVel(ROBOT_JOINT_VEL)
+        self.robot.SetBlending(ROBOT_BLENDING)
         self.robot.SetAutoConf(True)  # Auto-select best configuration
+
+        # Configure acceleration control for smoother motion
+        if ENABLE_ACC_CTRL:
+            try:
+                # SetAccCtrl: Set acceleration control (percentage of maximum acceleration)
+                # Lower values = smoother but slower acceleration
+                self.robot.SetCartAcc(50)  # 50% of max cartesian acceleration
+                self.robot.SetJointAcc(50)  # 50% of max joint acceleration
+                self.logger.info("Acceleration control enabled (50% of max)")
+            except AttributeError:
+                self.logger.warning("SetAccCtrl not available in this robot firmware")
 
         self.robot.WaitIdle(IDLE_TIMEOUT)
 
@@ -668,11 +850,33 @@ def main():
                 preprocessor_overrides={"device_processor": {"device": device.type}}
             )
 
+            # Initialize action smoother
+            action_smoother = ActionSmoother(
+                action_dim=6,
+                ema_alpha=EMA_ALPHA,
+                temporal_ensemble_weights=TEMPORAL_ENSEMBLE_WEIGHTS
+            )
+            logger.info(f"Action smoother initialized:")
+            logger.info(f"  EMA enabled: {ENABLE_EMA_FILTER}, alpha={EMA_ALPHA}")
+            logger.info(f"  Temporal ensemble enabled: {ENABLE_TEMPORAL_ENSEMBLE}")
+            if ENABLE_TEMPORAL_ENSEMBLE:
+                logger.info(f"  Temporal ensemble weights: {TEMPORAL_ENSEMBLE_WEIGHTS}")
+
             logger.info(colored("Setup complete!", "green"))
             logger.info(f"Target: {TARGET_COLOR}")
             logger.info(f"Robot type: {ROBOT_TYPE}")
             logger.info(f"Control frequency: {CONTROL_FREQUENCY} Hz")
             logger.info(f"Action scale: XYZ={ACTION_SCALE_XYZ}mm, Rot={ACTION_SCALE_ROT}deg")
+            if ENABLE_TIME_SCALE:
+                logger.warning(f"Time scale: {TIME_SCALE}x (LEGACY MODE - NOT RECOMMENDED)")
+            else:
+                logger.info(f"Time scale: {TIME_SCALE}x (time scaling disabled - recommended)")
+            if DATA_ACTION_MIN is not None and DATA_ACTION_MAX is not None:
+                logger.info(f"Using dataset statistics for normalization")
+            else:
+                logger.info(f"Using model output directly (no dataset stats normalization)")
+            logger.info(f"Robot motion: Blending={ROBOT_BLENDING}, CartLinVel={ROBOT_CART_LIN_VEL}mm/s, JointVel={ROBOT_JOINT_VEL}%")
+            logger.info(f"Acceleration control: {'Enabled (50%)' if ENABLE_ACC_CTRL else 'Disabled'}")
 
             # Warmup inference
             logger.info("Warming up model...")
@@ -706,8 +910,9 @@ def main():
             while episode_count < MAX_EPISODES:
                 logger.info(colored(f"\n=== Episode {episode_count + 1}/{MAX_EPISODES} ===", "cyan"))
 
-                # Reset policy for new episode
+                # Reset policy and smoother for new episode
                 policy.reset()
+                action_smoother.reset()
 
                 episode_start_time = time.time()
 
@@ -727,9 +932,9 @@ def main():
                         time.sleep(0.01)
                         continue
 
-                    # Display camera preview with action overlay
+                    # Display camera preview (will be updated with action info later)
+                    display_frames = []
                     if SHOW_CAMERA_PREVIEW:
-                        display_frames = []
                         for i in range(1, num_cameras + 1):
                             cam_key = f"camera{i}"
                             if cam_key in frames:
@@ -738,27 +943,7 @@ def main():
                                 # Add camera label
                                 cv2.putText(frame_bgr, cam_key, (10, 30),
                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-                                # Add action info (if available) - translation and rotation
-                                if step > 0:
-                                    xyz_text = f"XYZ: [{action_scaled[0]:+.2f}, {action_scaled[1]:+.2f}, {action_scaled[2]:+.2f}]"
-                                    rot_text = f"Rot: [{action_scaled[3]:+.2f}, {action_scaled[4]:+.2f}, {action_scaled[5]:+.2f}]"
-                                    cv2.putText(frame_bgr, xyz_text, (10, 60),
-                                               cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-                                    cv2.putText(frame_bgr, rot_text, (10, 85),
-                                               cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 200, 255), 1)
                                 display_frames.append(frame_bgr)
-
-                        # Stack frames horizontally
-                        if len(display_frames) == num_cameras:
-                            combined = np.hstack(display_frames)
-                            # Resize if too large
-                            if combined.shape[1] > 1920:
-                                scale = 1920 / combined.shape[1]
-                                new_width = int(combined.shape[1] * scale)
-                                new_height = int(combined.shape[0] * scale)
-                                combined = cv2.resize(combined, (new_width, new_height))
-                            cv2.imshow("VLA Inference - Camera Views", combined)
-                            cv2.waitKey(1)  # Non-blocking
 
                     # Create observation
                     if ENABLE_PROFILING:
@@ -799,20 +984,86 @@ def main():
                         logger.error(f"Unexpected action format: {type(action)}")
                         continue
 
-                    if action_np.ndim == 2:
-                        action_np = action_np[0]
+                    # Handle action shape
+                    # action_np can be:
+                    # - (1, chunk_size, 6) - batched chunk
+                    # - (chunk_size, 6) - unbatched chunk
+                    # - (1, 6) - batched single action
+                    # - (6,) - single action
+                    if action_np.ndim == 3:
+                        # Batched chunk: (1, chunk_size, 6) -> (chunk_size, 6)
+                        action_chunk = action_np[0]
+                        current_action = action_chunk[0]  # Use first action in chunk
+                    elif action_np.ndim == 2:
+                        if action_np.shape[0] == 1:
+                            # Batched single action: (1, 6) -> (6,)
+                            current_action = action_np[0]
+                            action_chunk = current_action.reshape(1, -1)  # Treat as chunk of size 1
+                        else:
+                            # Unbatched chunk: (chunk_size, 6)
+                            action_chunk = action_np
+                            current_action = action_chunk[0]
+                    else:
+                        # Single action: (6,)
+                        current_action = action_np
+                        action_chunk = current_action.reshape(1, -1)
 
-                    # Apply action and time scaling
-                    action_scaled = action_np.copy()
+                    # Apply action and time scaling to entire chunk
+                    action_chunk_scaled = action_chunk.copy()
+                    action_chunk_scaled[:, :3] *= ACTION_SCALE_XYZ * TIME_SCALE
+                    action_chunk_scaled[:, 3:] *= ACTION_SCALE_ROT * TIME_SCALE
+
+                    # Scale current action
+                    action_scaled = current_action.copy()
                     action_scaled[:3] *= ACTION_SCALE_XYZ * TIME_SCALE
                     action_scaled[3:] *= ACTION_SCALE_ROT * TIME_SCALE
 
+                    # Apply action smoothing
+                    action_smoothed = action_smoother.smooth(
+                        action_scaled,
+                        enable_ema=ENABLE_EMA_FILTER,
+                        enable_temporal_ensemble=ENABLE_TEMPORAL_ENSEMBLE,
+                        action_chunk=action_chunk_scaled if ENABLE_TEMPORAL_ENSEMBLE else None,
+                        current_step=total_steps
+                    )
+
                     # Execute action
-                    robot_manager.move_EE_single(action_scaled)
+                    robot_manager.move_EE_single(action_smoothed)
                     total_steps += 1
 
-                    # Update action history for graph
-                    action_history.append(action_scaled.copy())
+                    # Update camera preview with action info
+                    if SHOW_CAMERA_PREVIEW and len(display_frames) == num_cameras:
+                        for frame_bgr in display_frames:
+                            xyz_text = f"XYZ: [{action_smoothed[0]:+.2f}, {action_smoothed[1]:+.2f}, {action_smoothed[2]:+.2f}]"
+                            rot_text = f"Rot: [{action_smoothed[3]:+.2f}, {action_smoothed[4]:+.2f}, {action_smoothed[5]:+.2f}]"
+                            cv2.putText(frame_bgr, xyz_text, (10, 60),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+                            cv2.putText(frame_bgr, rot_text, (10, 85),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 200, 255), 1)
+                            # Add smoothing indicators
+                            if ENABLE_EMA_FILTER or ENABLE_TEMPORAL_ENSEMBLE:
+                                smoothing_text = "Smoothing: "
+                                if ENABLE_EMA_FILTER:
+                                    smoothing_text += f"EMA({EMA_ALPHA})"
+                                if ENABLE_TEMPORAL_ENSEMBLE:
+                                    if ENABLE_EMA_FILTER:
+                                        smoothing_text += " + "
+                                    smoothing_text += f"TE({len(TEMPORAL_ENSEMBLE_WEIGHTS)})"
+                                cv2.putText(frame_bgr, smoothing_text, (10, 110),
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+
+                        # Stack and display frames
+                        combined = np.hstack(display_frames)
+                        if combined.shape[1] > 1920:
+                            scale = 1920 / combined.shape[1]
+                            new_width = int(combined.shape[1] * scale)
+                            new_height = int(combined.shape[0] * scale)
+                            combined = cv2.resize(combined, (new_width, new_height))
+                        cv2.imshow("VLA Inference - Camera Views", combined)
+                        cv2.waitKey(1)
+
+                    # Update action history for graph (use smoothed action)
+                    action_history.append(action_smoothed.copy())
                     if len(action_history) > max_history:
                         action_history.pop(0)
 
@@ -834,11 +1085,11 @@ def main():
                             f"inf={t_inference*1000:.0f}ms | "
                             f"post={t_postprocess*1000:.0f}ms | "
                             f"total={total_time*1000:.0f}ms ({fps:.1f} FPS) | "
-                            f"xyz=[{action_scaled[0]:+.2f},{action_scaled[1]:+.2f},{action_scaled[2]:+.2f}] "
-                            f"rot=[{action_scaled[3]:+.2f},{action_scaled[4]:+.2f},{action_scaled[5]:+.2f}]"
+                            f"xyz=[{action_smoothed[0]:+.2f},{action_smoothed[1]:+.2f},{action_smoothed[2]:+.2f}] "
+                            f"rot=[{action_smoothed[3]:+.2f},{action_smoothed[4]:+.2f},{action_smoothed[5]:+.2f}]"
                         )
                     elif not ENABLE_PROFILING and total_steps % 50 == 0:
-                        logger.info(f"Step {total_steps}: action={action_scaled.round(3)}")
+                        logger.info(f"Step {total_steps}: action={action_smoothed.round(3)}")
 
                     # Maintain control frequency
                     elapsed = time.time() - step_start

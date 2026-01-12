@@ -1,0 +1,211 @@
+# Training Configuration for SmolVLA with LoRA
+# ==============================================
+# SmolVLA is HuggingFace's efficient vision-language-action model
+# LoRA (Low-Rank Adaptation) enables parameter-efficient fine-tuning
+#
+# Memory Requirements:
+# - Full Fine-Tuning: > 40 GB per GPU ❌
+# - LoRA Fine-Tuning: > 16 GB per GPU ✅ (works on RTX 3090!)
+#
+# LoRA Benefits:
+# - Only ~2-5% of parameters trained
+# - Much lower memory usage
+# - Faster training
+# - Smaller checkpoints (100-500 MB vs 3-5 GB)
+
+# Random seed for reproducibility
+seed: 1000
+
+# Output directory for checkpoints and logs
+output_dir: "outputs/train/smolvla_needle_insertion"
+
+# Dataset Configuration
+# ---------------------
+dataset:
+  # Root directory containing HDF5 episode files
+  root_dir: "/home/najo/NAS/VLA/dataset/New_dataset/collected_data/Red_point"
+
+  # Action prediction horizon (SmolVLA uses action chunks)
+  horizon: 50
+
+  # State representation
+  use_qpos: false        # Use joint positions (6 dims)
+  use_ee_pose: true      # Use end-effector pose (6 dims) - default
+
+  # Task instruction (SmolVLA uses language conditioning)
+  task_instruction: "Insert needle into red point"
+
+  # Data Augmentation
+  # -----------------
+  augment: true
+  augment_brightness: 0.15       # Max brightness change (±15%)
+  augment_contrast: 0.15         # Max contrast change (±15%)
+  augment_saturation: 0.10       # Saturation change (±10%)
+  augment_hue: 0.05              # Hue shift (±18 degrees)
+  augment_noise: 0.01            # Gaussian noise std (1%)
+
+# Policy Configuration
+# --------------------
+policy:
+  # SmolVLA VLM backbone
+  vlm_model_name: "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+
+  # Observation and action
+  n_obs_steps: 1         # Number of observation steps (SmolVLA uses single observation)
+  chunk_size: 50         # Action chunk size (action horizon)
+  n_action_steps: 50     # Number of action steps to execute
+
+  # Dimensions
+  max_state_dim: 32      # Maximum state dimension (padded)
+  max_action_dim: 32     # Maximum action dimension (padded)
+
+  # Flow matching parameters
+  num_steps: 10                # Number of denoising steps
+
+  # Image resolution (SmolVLA uses 512x512 with padding)
+  resize_imgs_with_padding: [512, 512]
+
+  # Tokenizer
+  tokenizer_max_length: 48     # Tokenizer max length
+
+  # Training optimization
+  freeze_vision_encoder: true  # Freeze vision encoder (train expert only)
+  train_expert_only: true      # Only train action expert (memory efficient)
+  train_state_proj: true       # Train state projection layer
+
+# LoRA Configuration
+# ------------------
+# Note: LoRA may not work well with SmolVLA's custom architecture
+# Use freeze_vision_encoder and train_expert_only for efficiency instead
+lora:
+  # Enable LoRA (EXPERIMENTAL - may not work with SmolVLA)
+  enable: false
+
+  # LoRA rank (controls number of trainable parameters)
+  # Higher rank = more parameters = better performance but more memory
+  lora_r: 8              # Typical values: 4, 8, 16, 32
+
+  # LoRA alpha (scaling factor)
+  # Typically set to 2x the rank
+  lora_alpha: 16         # Typical: 2 * lora_r
+
+  # LoRA dropout (regularization)
+  lora_dropout: 0.05     # Typical: 0.05-0.1
+
+  # Target modules (which layers to apply LoRA)
+  # Targeting attention and MLP layers for maximum impact
+  target_modules:
+    - "q_proj"           # Query projection
+    - "v_proj"           # Value projection
+    - "k_proj"           # Key projection
+    - "o_proj"           # Output projection
+    - "gate_proj"        # MLP gate projection
+    - "up_proj"          # MLP up projection
+    - "down_proj"        # MLP down projection
+
+# Training Configuration
+# ----------------------
+training:
+  # Training steps
+  steps: 30000           # 30k steps (typical training length)
+
+  # Batch size
+  batch_size: 4          # Per-GPU batch size (effective=20 with 5 GPUs)
+
+  # DataLoader settings
+  num_workers: 4
+  pin_memory: true
+
+  # Logging and saving
+  log_freq: 100          # Log every N steps
+  save_freq: 5000        # Save checkpoint every N steps
+
+  # Temporal consistency loss weight
+  # This encourages smooth action trajectories (matching inference smoothing)
+  lambda_temporal: 0.1   # Weight for temporal consistency loss (0.0 = disabled)
+
+# Optimizer Configuration
+# -----------------------
+optimizer:
+  lr: 0.0001             # Learning rate (1e-4, SmolVLA default)
+  betas: [0.9, 0.95]     # Adam betas
+  weight_decay: 0.0000000001  # Weight decay (1e-10, SmolVLA default)
+  eps: 0.00000001        # Adam epsilon (1e-8)
+  grad_clip_norm: 10.0   # Gradient clipping norm (SmolVLA default)
+
+# Scheduler Configuration
+# -----------------------
+scheduler:
+  num_warmup_steps: 1000      # Warmup steps
+  num_decay_steps: 30000      # Decay steps (matches training steps)
+  peak_lr: 0.0001             # Peak learning rate (1e-4)
+  decay_lr: 0.0000025         # Final learning rate (2.5e-6)
+
+# W&B (Weights & Biases) Configuration
+# ------------------------------------
+wandb:
+  # Enable W&B experiment tracking
+  enable: true
+
+  # W&B project name
+  project: "smolvla-meca500-insertion"
+
+  # W&B entity (username or team name)
+  # Leave as null to use default entity
+  entity: null
+
+  # Run name (auto-generated if null)
+  # Format: smolvla_YYYYMMDD_HHMMSS
+  name: null
+
+  # Tags for organizing runs
+  tags:
+    - "smolvla"
+    - "meca500"
+    - "needle-insertion"
+    - "expert-only"
+    - "temporal-consistency"
+
+  # Notes about this run
+  notes: "SmolVLA expert-only training with temporal consistency loss for Meca500 needle insertion"
+
+# Notes:
+# ------
+# SmolVLA Memory Efficiency (without LoRA):
+# 1. freeze_vision_encoder=True: Freezes vision encoder (~300M params frozen)
+# 2. train_expert_only=True: Only trains action expert (~100-200M params)
+# 3. Memory usage: ~12-16 GB per GPU (fits on RTX 3090!)
+# 4. Training speed: ~1-2 steps/sec
+# 5. Performance: Excellent for task-specific fine-tuning
+#
+# LoRA Support:
+# - Currently EXPERIMENTAL for SmolVLA (may not work due to custom architecture)
+# - Use freeze_vision_encoder + train_expert_only instead (recommended)
+# - If you want to try LoRA, set lora.enable=true
+#
+# Improvements from Inference Code:
+# - Temporal consistency loss (λ=0.1) for smoother trajectories
+# - Data augmentation for robustness
+# - Freeze vision encoder for efficiency
+# - Train expert only for memory efficiency
+#
+# Temporal Consistency Loss Tuning:
+# - lambda_temporal=0.0: Disabled (standard training)
+# - lambda_temporal=0.05-0.1: Light smoothing (recommended)
+# - lambda_temporal=0.2-0.5: Strong smoothing (may reduce responsiveness)
+#
+# Training Efficiency Options:
+# Option 1 (Recommended): freeze_vision_encoder=true, train_expert_only=true
+#   - Memory: ~12-16 GB per GPU
+#   - Trains: Action expert only
+#   - Best for: Task-specific fine-tuning
+#
+# Option 2 (Full Training): freeze_vision_encoder=false, train_expert_only=false
+#   - Memory: ~30-40 GB per GPU
+#   - Trains: All parameters
+#   - Best for: Major model adaptation
+#
+# Performance expectations:
+# - Expert-only training gives excellent results for specific tasks
+# - Smooth trajectories matching inference behavior
+# - Ideal for real robot deployment (Meca500)
