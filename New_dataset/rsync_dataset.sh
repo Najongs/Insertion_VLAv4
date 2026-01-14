@@ -14,3 +14,7 @@ cd /home/najo/NAS/VLA/dataset/New_dataset
 # wget으로 긁어오기 (IP주소 변경 필요!)
 wget -r -np -R "index.html*" http://10.130.41.45:8888/
 10.130.41.45
+
+
+rsync -avP -e ssh /home/najo/NAS/VLA/Insertion_VLAv4/Train/outputs/train/smolvla_needle_insertion/checkpoints/checkpoint_step_4000.pt irom@10.130.41.45:/home/irom/NAS/VLA/Insertion_VLAv4/Inference
+

@@ -24,10 +24,18 @@ import logging
 import os
 import sys
 import time
+import gc
 from pathlib import Path
 from typing import Dict, List, Optional
 from contextlib import nullcontext
 import yaml
+
+# Memory monitoring
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 
 import torch
 import torch.nn as nn
@@ -60,6 +68,9 @@ from lerobot.policies.utils import get_device_from_parameters
 
 # HDF5 VLA imports
 from hdf5_lerobot_adapter import create_hdf5_lerobot_dataset, hdf5_lerobot_collate_fn
+
+# Normalization imports
+from normalization_utils import Normalizer, load_stats
 
 # Initialize logging
 init_logging()
@@ -170,13 +181,13 @@ def create_dataset_from_config(config: Dict) -> torch.utils.data.Dataset:
     if "hdf5_files" in dataset_cfg:
         hdf5_files = [root_dir / f for f in dataset_cfg["hdf5_files"]]
     else:
-        hdf5_files = sorted(list(root_dir.glob("*.h5")) + list(root_dir.glob("*.hdf5")))
+        hdf5_files = sorted(list(root_dir.rglob("*.h5")) + list(root_dir.rglob("*.hdf5")))
 
     if len(hdf5_files) == 0:
         raise FileNotFoundError(f"No HDF5 files found in {root_dir}")
 
     if is_main_process():
-        logger.info(f"Found {len(hdf5_files)} HDF5 files")
+        logger.info(f"Loading dataset from {len(hdf5_files)} HDF5 files...")
 
     # Create tokenizer for language conditioning
     from transformers import AutoTokenizer
@@ -194,7 +205,8 @@ def create_dataset_from_config(config: Dict) -> torch.utils.data.Dataset:
         squeeze_n_obs_steps=(policy_cfg.get("n_obs_steps", 1) == 1),
         use_qpos=dataset_cfg.get("use_qpos", False),
         use_ee_pose=dataset_cfg.get("use_ee_pose", True),
-        task_instruction=dataset_cfg.get("task_instruction", "Insert needle into red point"),
+        use_ee_pose_delta_as_action=dataset_cfg.get("use_ee_pose_delta_as_action", False),
+        task_instruction=dataset_cfg.get("task_instruction", "Insert needle into eye trocar."),
         tokenizer=tokenizer,
         tokenizer_max_length=tokenizer_max_length,
         augment=dataset_cfg.get("augment", True),
@@ -320,6 +332,26 @@ def create_scheduler_from_config(optimizer: AdamW, config: Dict) -> LambdaLR:
     return scheduler
 
 
+def normalize_batch(batch: dict, normalizer: Optional[Normalizer], device: torch.device) -> dict:
+    """Apply normalization to state and action in batch."""
+    if normalizer is None:
+        return batch
+
+    normalized_batch = {}
+    for key, value in batch.items():
+        if key == "observation.state":
+            # Normalize state
+            normalized_batch[key] = normalizer.normalize(value.to(device), key)
+        elif key == "action":
+            # Normalize action
+            normalized_batch[key] = normalizer.normalize(value.to(device), key)
+        else:
+            # Keep other keys as-is
+            normalized_batch[key] = value.to(device) if isinstance(value, torch.Tensor) else value
+
+    return normalized_batch
+
+
 def update_policy(
     policy: nn.Module,
     batch: dict,
@@ -328,15 +360,30 @@ def update_policy(
     grad_clip_norm: float,
     lr_scheduler: LambdaLR,
     lambda_temporal: float,
+    normalizer: Optional[Normalizer] = None,
     use_amp: bool = False,
+    gradient_accumulation_steps: int = 1,
+    accumulation_step: int = 0,
 ):
     """
-    Performs a single training step (following lerobot_train.py structure).
+    Performs a single training step with gradient accumulation support.
+
+    Args:
+        gradient_accumulation_steps: Number of steps to accumulate gradients
+        accumulation_step: Current step in accumulation cycle (0 to gradient_accumulation_steps-1)
+        normalizer: Optional normalizer for state and action
     """
     device = get_device_from_parameters(policy)
     policy.train()
 
-    with torch.autocast(device_type=device.type) if use_amp else nullcontext():
+    # Apply normalization to batch
+    batch = normalize_batch(batch, normalizer, device)
+
+    # Scale loss by accumulation steps to maintain gradient magnitude
+    loss_scale = 1.0 / gradient_accumulation_steps
+
+    # Use float16 explicitly for AMP (not bfloat16, as GradScaler doesn't support bfloat16)
+    with torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
         # Forward pass - SmolVLA returns (loss, loss_dict) tuple
         loss, loss_dict = policy.forward(batch)
         action_loss = loss
@@ -349,23 +396,46 @@ def update_policy(
         else:
             temporal_loss = torch.tensor(0.0, device=device)
 
-    grad_scaler.scale(loss).backward()
-    grad_scaler.unscale_(optimizer)
+        # Scale loss for gradient accumulation
+        loss = loss * loss_scale
 
-    grad_norm = torch.nn.utils.clip_grad_norm_(
-        policy.parameters(),
-        grad_clip_norm,
-        error_if_nonfinite=False,
-    )
+    # Backward pass (use GradScaler for float16 stability)
+    if use_amp:
+        grad_scaler.scale(loss).backward()
+    else:
+        loss.backward()
 
-    grad_scaler.step(optimizer)
-    grad_scaler.update()
-    optimizer.zero_grad()
+    # Only update weights after accumulating gradients
+    is_update_step = (accumulation_step + 1) % gradient_accumulation_steps == 0
 
-    if lr_scheduler is not None:
-        lr_scheduler.step()
+    if is_update_step:
+        if use_amp:
+            # AMP: unscale gradients before clipping
+            grad_scaler.unscale_(optimizer)
 
-    return loss.item(), action_loss.item(), temporal_loss.item(), grad_norm.item()
+        # Clip gradients
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            policy.parameters(),
+            grad_clip_norm,
+            error_if_nonfinite=False,
+        )
+
+        # Update weights
+        if use_amp:
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+        else:
+            optimizer.step()
+
+        optimizer.zero_grad(set_to_none=True)
+
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+    else:
+        grad_norm = 0.0
+
+    # Return unscaled loss for logging
+    return loss.item() / loss_scale, action_loss.item(), temporal_loss.item(), grad_norm if isinstance(grad_norm, float) else grad_norm.item()
 
 
 def train(
@@ -377,6 +447,7 @@ def train(
     config: Dict,
     rank: int,
     world_size: int,
+    normalizer: Optional[Normalizer] = None,
     wandb_run=None,
 ):
     """Main training loop (following lerobot_train.py structure)."""
@@ -388,6 +459,8 @@ def train(
     save_freq = training_cfg.get("save_freq", 5000)
     grad_clip_norm = optimizer_cfg.get("grad_clip_norm", 10.0)
     lambda_temporal = training_cfg.get("lambda_temporal", 0.1)
+    gradient_accumulation_steps = training_cfg.get("gradient_accumulation_steps", 1)
+    use_amp = training_cfg.get("use_amp", False)
 
     output_dir = Path(config["output_dir"])
     checkpoints_dir = output_dir / "checkpoints"
@@ -401,33 +474,57 @@ def train(
     running_grad_norm = 0.0
 
     # W&B: Log model architecture (main process only)
+    # DISABLED: wandb.watch causes memory accumulation over long training runs
+    # We'll log metrics manually instead
     if is_main_process() and wandb_run is not None:
-        try:
-            wandb.watch(policy, log="all", log_freq=log_freq)
-        except Exception as e:
-            logger.warning(f"Failed to setup wandb.watch: {e}")
+        logger.info("W&B watch disabled to prevent memory accumulation")
+        # try:
+        #     wandb.watch(policy, log="gradients", log_freq=log_freq * 10)
+        #     logger.info(f"W&B watch enabled: log='gradients', log_freq={log_freq * 10}")
+        # except Exception as e:
+        #     logger.warning(f"Failed to setup wandb.watch: {e}")
 
     if is_main_process():
+        batch_size = training_cfg.get('batch_size', 8)
+        effective_batch = batch_size * world_size * gradient_accumulation_steps
         logger.info("=" * 80)
         logger.info("Starting SmolVLA Expert-Only Training")
         logger.info("=" * 80)
         logger.info(f"Total steps: {total_steps}")
-        logger.info(f"Batch size per GPU: {training_cfg.get('batch_size', 8)}")
-        logger.info(f"Effective batch size: {training_cfg.get('batch_size', 8) * world_size}")
+        logger.info(f"Batch size per GPU: {batch_size}")
         logger.info(f"Number of GPUs: {world_size}")
+        logger.info(f"Gradient accumulation steps: {gradient_accumulation_steps}")
+        logger.info(f"Effective batch size: {effective_batch}")
         logger.info(f"Gradient clip norm: {grad_clip_norm}")
         logger.info(f"Temporal consistency weight (λ): {lambda_temporal}")
+        logger.info(f"Mixed Precision (AMP): {use_amp} (dtype=float16)")
         if wandb_run is not None:
             logger.info(f"W&B tracking: {wandb_run.url}")
         logger.info("=" * 80)
 
     start_time = time.time()
 
-    # Infinite dataloader (cycle)
-    from itertools import cycle
-    dl_iter = cycle(dataloader)
+    # Create DataLoader iterator (regenerate periodically to prevent memory buildup)
+    # Using manual epoch looping instead of itertools.cycle to avoid buffer accumulation
+    def get_dataloader_iterator():
+        """Create a fresh dataloader iterator to prevent memory buildup."""
+        while True:
+            for batch in dataloader:
+                yield batch
+
+    dl_iter = get_dataloader_iterator()
+
+    # Progress bar (only on main process)
+    if is_main_process():
+        pbar = tqdm(total=total_steps, desc="Training", unit="step",
+                   bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+    else:
+        pbar = None
 
     for step in range(total_steps):
+        # Calculate accumulation step (0 to gradient_accumulation_steps-1)
+        accumulation_step = step % gradient_accumulation_steps
+
         # Get batch
         batch = next(dl_iter)
 
@@ -435,7 +532,7 @@ def train(
         batch = {k: v.to(get_device_from_parameters(policy)) if isinstance(v, torch.Tensor) else v
                  for k, v in batch.items()}
 
-        # Update policy
+        # Update policy with gradient accumulation
         loss, action_loss, temporal_loss, grad_norm = update_policy(
             policy,
             batch,
@@ -444,14 +541,37 @@ def train(
             grad_clip_norm,
             scheduler,
             lambda_temporal,
-            use_amp=False,
+            normalizer=normalizer,
+            use_amp=use_amp,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            accumulation_step=accumulation_step,
         )
 
-        # Accumulate losses
+        # Accumulate losses (detach from computation graph to prevent memory buildup)
         running_loss += loss
         running_action_loss += action_loss
         running_temporal_loss += temporal_loss
-        running_grad_norm += grad_norm
+        if grad_norm > 0:  # Only accumulate when weights are updated
+            running_grad_norm += grad_norm
+
+        # MEMORY FIX: Explicitly delete batch and clear caches periodically
+        del batch
+
+        # Every 50 steps: aggressive memory cleanup
+        if (step + 1) % 50 == 0:
+            torch.cuda.empty_cache()  # Clear CUDA cache
+            gc.collect()  # Force Python garbage collection to prevent RAM buildup
+
+        # Update progress bar
+        if pbar is not None:
+            pbar.update(1)
+            # Update postfix every step with current metrics
+            if (step + 1) % 10 == 0:
+                current_lr = scheduler.get_last_lr()[0]
+                pbar.set_postfix({
+                    'loss': f'{running_loss / min(step % log_freq + 1, log_freq):.4f}',
+                    'lr': f'{current_lr:.2e}'
+                })
 
         # Logging
         if (step + 1) % log_freq == 0 and is_main_process():
@@ -463,29 +583,54 @@ def train(
             steps_per_sec = log_freq / elapsed_time
             lr = scheduler.get_last_lr()[0]
 
+            # Memory monitoring
+            if PSUTIL_AVAILABLE:
+                process = psutil.Process()
+                ram_gb = process.memory_info().rss / (1024 ** 3)  # Convert to GB
+                ram_percent = process.memory_percent()
+            else:
+                ram_gb = 0.0
+                ram_percent = 0.0
+
+            # CUDA memory
+            if torch.cuda.is_available():
+                cuda_mem_allocated = torch.cuda.memory_allocated() / (1024 ** 3)  # GB
+                cuda_mem_reserved = torch.cuda.memory_reserved() / (1024 ** 3)  # GB
+            else:
+                cuda_mem_allocated = 0.0
+                cuda_mem_reserved = 0.0
+
+            # Progress percentage
+            progress_pct = (step + 1) / total_steps * 100
+
             log_msg = (
-                f"Step {step + 1}/{total_steps} | "
-                f"Loss: {avg_loss:.4f} | "
-                f"Action: {avg_action_loss:.4f} | "
-                f"Temporal: {avg_temporal_loss:.4f} | "
+                f"[{progress_pct:5.1f}%] Step {step + 1}/{total_steps} | "
+                f"Loss: {avg_loss:.4f} (Action: {avg_action_loss:.4f}, Temporal: {avg_temporal_loss:.4f}) | "
                 f"GradNorm: {avg_grad_norm:.3f} | "
                 f"LR: {lr:.2e} | "
-                f"Steps/sec: {steps_per_sec:.2f}"
+                f"{steps_per_sec:.2f} steps/sec | "
+                f"VRAM: {cuda_mem_allocated:.1f}GB"
             )
 
-            logger.info(log_msg)
+            pbar.write(log_msg)  # Write to tqdm output
 
-            # W&B logging
+            # W&B logging (create dict without holding references)
             if wandb_run is not None:
-                wandb.log({
-                    "train/loss": avg_loss,
-                    "train/action_loss": avg_action_loss,
-                    "train/temporal_loss": avg_temporal_loss,
-                    "train/grad_norm": avg_grad_norm,
-                    "train/learning_rate": lr,
-                    "train/steps_per_sec": steps_per_sec,
-                    "step": step + 1,
-                })
+                log_dict = {
+                    "train/loss": float(avg_loss),
+                    "train/action_loss": float(avg_action_loss),
+                    "train/temporal_loss": float(avg_temporal_loss),
+                    "train/grad_norm": float(avg_grad_norm),
+                    "train/learning_rate": float(lr),
+                    "train/steps_per_sec": float(steps_per_sec),
+                    "system/ram_gb": float(ram_gb),
+                    "system/ram_percent": float(ram_percent),
+                    "system/vram_allocated_gb": float(cuda_mem_allocated),
+                    "system/vram_reserved_gb": float(cuda_mem_reserved),
+                    "step": int(step + 1),
+                }
+                wandb.log(log_dict)
+                del log_dict  # Explicitly delete to free memory
 
             # Reset
             running_loss = 0.0
@@ -494,43 +639,116 @@ def train(
             running_grad_norm = 0.0
             start_time = time.time()
 
-        # Save checkpoint
+        # Intermediate checkpoint saving
         if (step + 1) % save_freq == 0 and is_main_process():
-            checkpoint_dir = checkpoints_dir / f"checkpoint_step_{step + 1}"
+            logger.info(f"Saving checkpoint at step {step + 1}...")
 
             # Get the actual policy (unwrap DDP if necessary)
             policy_to_save = policy.module if isinstance(policy, DDP) else policy
-            policy_to_save.save_pretrained(checkpoint_dir)
-            logger.info(f"Saved checkpoint to {checkpoint_dir}")
 
-            # W&B: Upload checkpoint as artifact
-            if wandb_run is not None:
-                try:
-                    artifact = wandb.Artifact(
-                        name=f"checkpoint_step_{step + 1}",
-                        type="model",
-                        description=f"SmolVLA checkpoint at step {step + 1}",
-                        metadata={
-                            "step": step + 1,
-                            "loss": avg_loss,
-                            "action_loss": avg_action_loss,
-                            "temporal_loss": avg_temporal_loss,
-                        }
-                    )
-                    artifact.add_dir(str(checkpoint_dir))
-                    wandb.log_artifact(artifact)
-                    logger.info(f"Uploaded checkpoint to W&B")
-                except Exception as e:
-                    logger.warning(f"Failed to upload checkpoint to W&B: {e}")
+            checkpoint_path = checkpoints_dir / f"checkpoint_step_{step + 1}.pt"
 
-    # Save final checkpoint
+            checkpoint_dict = {
+                "step": step + 1,
+                "epoch": 0,
+                "policy_state_dict": policy_to_save.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "config": config,
+            }
+
+            # Save normalization stats if normalizer is used
+            if normalizer is not None:
+                checkpoint_dict["normalization_stats"] = normalizer.stats
+
+            torch.save(checkpoint_dict, checkpoint_path)
+            logger.info(f"Saved checkpoint to: {checkpoint_path}")
+
+    # Close progress bar
+    if pbar is not None:
+        pbar.close()
+
+    # Save final checkpoint as .pt (matching inference format)
     if is_main_process():
-        final_checkpoint_path = checkpoints_dir / "final"
-        policy_to_save = policy.module if isinstance(policy, DDP) else policy
-        policy_to_save.save_pretrained(final_checkpoint_path)
-        logger.info(f"Saved final checkpoint to {final_checkpoint_path}")
         logger.info("=" * 80)
-        logger.info("Training completed!")
+        logger.info("Saving final model...")
+        logger.info("=" * 80)
+
+        # Get the actual policy (unwrap DDP if necessary)
+        policy_to_save = policy.module if isinstance(policy, DDP) else policy
+
+        # Compute normalization statistics from dataset
+        logger.info("Computing action normalization statistics from dataset...")
+        all_actions = []
+        sample_count = 0
+        max_samples = 10000  # Sample up to 10k actions for statistics
+
+        for batch in dataloader:
+            if "action" in batch:
+                actions = batch["action"]
+                # Handle different action shapes: (B, T, D) or (B, D)
+                if actions.ndim == 3:
+                    actions = actions.reshape(-1, actions.shape[-1])  # (B*T, D)
+                elif actions.ndim == 2:
+                    pass  # Already (B, D)
+                all_actions.append(actions.cpu().numpy())
+                sample_count += actions.shape[0]
+
+            if sample_count >= max_samples:
+                break
+
+        # Compute statistics
+        if len(all_actions) > 0:
+            all_actions = np.concatenate(all_actions, axis=0)
+            action_min = all_actions.min(axis=0)  # (D,)
+            action_max = all_actions.max(axis=0)  # (D,)
+            action_mean = all_actions.mean(axis=0)  # (D,)
+            action_std = all_actions.std(axis=0)  # (D,)
+
+            logger.info(f"Action statistics computed from {len(all_actions)} samples:")
+            logger.info(f"  Min: {action_min}")
+            logger.info(f"  Max: {action_max}")
+            logger.info(f"  Mean: {action_mean}")
+            logger.info(f"  Std: {action_std}")
+        else:
+            logger.warning("No actions found in dataset, using default normalization")
+            action_dim = 6
+            action_min = np.array([-1.0] * action_dim)
+            action_max = np.array([1.0] * action_dim)
+            action_mean = np.array([0.0] * action_dim)
+            action_std = np.array([1.0] * action_dim)
+
+        # Save as .pt checkpoint (matching lerobot_to_MECA.py format)
+        final_checkpoint_path = checkpoints_dir / "checkpoint_latest.pt"
+
+        checkpoint_dict = {
+            "step": total_steps,
+            "epoch": 0,  # Not used in this training script
+            "policy_state_dict": policy_to_save.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "config": config,
+            # Normalization statistics (for inference)
+            "action_min": action_min,
+            "action_max": action_max,
+            "action_mean": action_mean,
+            "action_std": action_std,
+        }
+
+        # Save normalization stats if normalizer is used
+        if normalizer is not None:
+            checkpoint_dict["normalization_stats"] = normalizer.stats
+
+        torch.save(checkpoint_dict, final_checkpoint_path)
+        logger.info(f"Saved final checkpoint (.pt) to: {final_checkpoint_path}")
+
+        # Also save HuggingFace format for compatibility
+        hf_checkpoint_path = checkpoints_dir / "final_hf"
+        policy_to_save.save_pretrained(hf_checkpoint_path)
+        logger.info(f"Saved HuggingFace format to: {hf_checkpoint_path}")
+
+        logger.info("=" * 80)
+        logger.info("Training completed successfully!")
         logger.info("=" * 80)
 
 
@@ -575,18 +793,58 @@ def main():
     dataset = create_dataset_from_config(config)
 
     # Create dataloader with distributed sampler (following lerobot_train.py)
-    sampler = DistributedSampler(dataset, shuffle=True) if is_distributed else None
+    sampler = DistributedSampler(dataset, shuffle=False) if is_distributed else None
+
+    # Use num_workers from config (set to 0 to avoid shared memory OOM in DDP)
+    # With 5 GPUs and large images (512x512x3), multi-worker DataLoader uses too much shared memory
+    num_workers = config["training"].get("num_workers", 0)
+
+    if is_main_process():
+        if num_workers == 0:
+            logger.info("DataLoader: num_workers=0 (loading in main process to avoid shared memory OOM)")
+        else:
+            logger.info(f"DataLoader: num_workers={num_workers}")
+
     dataloader = DataLoader(
         dataset,
         batch_size=config["training"]["batch_size"],
         shuffle=(sampler is None),
-        num_workers=config["training"].get("num_workers", 4),
-        pin_memory=(device.type == "cuda"),
+        num_workers=num_workers,
+        pin_memory=config["training"].get("pin_memory", True),  # Enable for faster GPU transfer
         sampler=sampler,
         collate_fn=hdf5_lerobot_collate_fn,
         drop_last=False,
-        prefetch_factor=2,
+        prefetch_factor=2 if num_workers > 0 else None,  # Prefetch 2 batches per worker
+        persistent_workers=(num_workers > 0),  # Keep workers alive for better performance
     )
+
+    # Create normalizer if normalization is enabled
+    normalizer = None
+    if config.get("normalization", {}).get("enable", False):
+        stats_file = config["normalization"].get("stats_file", "dataset_stats.yaml")
+        stats_path = Path(__file__).parent / stats_file
+
+        if stats_path.exists():
+            if is_main_process():
+                logger.info("=" * 80)
+                logger.info("Loading Normalization Statistics")
+                logger.info("=" * 80)
+                logger.info(f"Stats file: {stats_path}")
+
+            stats = load_stats(str(stats_path))
+            normalizer = Normalizer(stats).to(device)
+
+            if is_main_process():
+                logger.info("Normalizer created successfully")
+                logger.info(f"  Action mean: {stats['action']['mean'][:3]}...")
+                logger.info(f"  Action std:  {stats['action']['std'][:3]}...")
+                logger.info(f"  State mean:  {stats['observation.state']['mean'][:3]}...")
+                logger.info(f"  State std:   {stats['observation.state']['std'][:3]}...")
+                logger.info("=" * 80)
+        else:
+            if is_main_process():
+                logger.warning(f"Normalization enabled but stats file not found: {stats_path}")
+                logger.warning("Training without normalization!")
 
     # Create policy
     policy = create_policy_from_config(config, device)
@@ -605,7 +863,10 @@ def main():
     # Create optimizer and scheduler
     optimizer = create_optimizer_from_config(policy, config)
     scheduler = create_scheduler_from_config(optimizer, config)
-    grad_scaler = GradScaler(device.type, enabled=False)
+
+    # Create GradScaler for Mixed Precision Training
+    use_amp = config["training"].get("use_amp", False)
+    grad_scaler = GradScaler(device.type, enabled=use_amp)
 
     # Setup W&B (main process only)
     wandb_run = None
@@ -614,7 +875,7 @@ def main():
 
     # Train
     try:
-        train(policy, dataloader, optimizer, scheduler, grad_scaler, config, rank, world_size, wandb_run)
+        train(policy, dataloader, optimizer, scheduler, grad_scaler, config, rank, world_size, normalizer, wandb_run)
     except KeyboardInterrupt:
         if is_main_process():
             logger.info("\nTraining interrupted by user")

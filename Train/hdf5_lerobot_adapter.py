@@ -56,6 +56,7 @@ class HDF5LeRobotDataset(Dataset):
         n_obs_steps: int = 1,
         use_qpos: bool = False,
         use_ee_pose: bool = True,
+        use_ee_pose_delta_as_action: bool = False,
         task_instruction: str = "Insert the needle into the target point",
         camera_dropout_prob: float = 0.0,
         min_cameras: int = 1,
@@ -77,6 +78,7 @@ class HDF5LeRobotDataset(Dataset):
             n_obs_steps: Number of observation steps (temporal stacking)
             use_qpos: Use joint positions for state (6 dims)
             use_ee_pose: Use end-effector pose for state (6 dims, default)
+            use_ee_pose_delta_as_action: Calculate action from ee_pose delta
             task_instruction: Task instruction text
             camera_dropout_prob: Probability of dropping out cameras (0.0 = disabled)
             min_cameras: Minimum number of cameras to keep active
@@ -99,6 +101,7 @@ class HDF5LeRobotDataset(Dataset):
         self.squeeze_n_obs_steps = squeeze_n_obs_steps
         self.use_qpos = use_qpos
         self.use_ee_pose = use_ee_pose
+        self.use_ee_pose_delta_as_action = use_ee_pose_delta_as_action
         self.task = task_instruction
 
         # Tokenizer for language conditioning
@@ -149,13 +152,13 @@ class HDF5LeRobotDataset(Dataset):
         # Detect image format (JPEG vs GZIP)
         self.is_jpeg_format = self._detect_image_format()
 
-        logger.info(f"Loaded HDF5 episode: {self.hdf5_path.name}")
-        logger.info(f"  Episode index: {self.episode_index}")
-        logger.info(f"  Total frames: {self.num_frames}")
-        logger.info(f"  Cameras: {self.num_cameras}")
-        logger.info(f"  Image format: {'JPEG (compressed)' if self.is_jpeg_format else 'GZIP (uncompressed)'}")
-        logger.info(f"  State dim: {self.state_dim} ({'qpos+ee_pose' if use_qpos and use_ee_pose else 'qpos' if use_qpos else 'ee_pose'})")
-        logger.info(f"  Task: {self.task}")
+        # Reduce logging verbosity - only log summary
+        if episode_index == 0:
+            logger.info(f"Loading HDF5 episodes from {self.hdf5_path.parent}")
+            logger.info(f"  Cameras: {self.num_cameras} | State: {self.state_dim}D | Format: {'JPEG' if self.is_jpeg_format else 'GZIP'}")
+            if self.use_ee_pose_delta_as_action:
+                logger.info("  Action mode: 'use_ee_pose_delta_as_action' is ENABLED")
+
 
     def _detect_image_format(self) -> bool:
         """
@@ -195,7 +198,11 @@ class HDF5LeRobotDataset(Dataset):
     def __len__(self) -> int:
         # Subtract (n_obs_steps - 1) for temporal stacking and (horizon - 1) for action sequences
         # We need at least n_obs_steps frames to create temporal observations
-        return max(0, self.num_frames - max(self.n_obs_steps - 1, 0) - self.horizon + 1)
+        effective_num_frames = self.num_frames
+        if self.use_ee_pose_delta_as_action:
+            # Need t+1 to compute action for frame t, so we lose one sample.
+            effective_num_frames -= 1
+        return max(0, effective_num_frames - max(self.n_obs_steps - 1, 0) - self.horizon + 1)
 
     def apply_image_augmentation(self, img_np: np.ndarray) -> np.ndarray:
         """
@@ -379,30 +386,65 @@ class HDF5LeRobotDataset(Dataset):
                     lerobot_sample[key] = lerobot_sample[key].squeeze(0)
 
         # Process actions
-        if self.horizon == 1:
-            # Single-step action
-            action = self.h5file['action'][idx]
-            lerobot_sample["action"] = torch.from_numpy(action.astype(np.float32))
-            # No padding for single-step
-            lerobot_sample["action_is_pad"] = torch.tensor([False], dtype=torch.bool)
+        if self.use_ee_pose_delta_as_action:
+            # NEW LOGIC: Calculate action from ee_pose delta.
+            if self.horizon == 1:
+                # For a single step, action at `idx` is `pose[idx+1] - pose[idx]`.
+                # __len__ ensures `idx+1` is always valid.
+                pose_t0 = self.h5file['observations']['ee_pose'][idx]
+                pose_t1 = self.h5file['observations']['ee_pose'][idx + 1]
+                action = pose_t1 - pose_t0
+                lerobot_sample["action"] = torch.from_numpy(action.astype(np.float32))
+                lerobot_sample["action_is_pad"] = torch.tensor([False], dtype=torch.bool)
+            else:
+                # For multi-step, we need poses from `idx` to `idx + horizon`.
+                end_idx_for_poses = min(idx + self.horizon + 1, self.num_frames)
+                poses = self.h5file['observations']['ee_pose'][idx:end_idx_for_poses]
+
+                actions = poses[1:] - poses[:-1]
+                original_len = actions.shape[0]
+
+                # Pad if necessary
+                if original_len < self.horizon:
+                    if original_len > 0:
+                        padding = np.repeat(actions[-1:], self.horizon - original_len, axis=0)
+                    else:
+                        padding = np.zeros((self.horizon, self.h5file['observations']['ee_pose'].shape[1]), dtype=np.float32)
+                    actions = np.concatenate([actions, padding], axis=0)
+
+                # Create action_is_pad mask
+                action_is_pad = torch.zeros(self.horizon, dtype=torch.bool)
+                if original_len < self.horizon:
+                    action_is_pad[original_len:] = True
+
+                lerobot_sample["action"] = torch.from_numpy(actions.astype(np.float32))
+                lerobot_sample["action_is_pad"] = action_is_pad
         else:
-            # Multi-step action chunk
-            end_idx = min(idx + self.horizon, self.num_frames)
-            actions = self.h5file['action'][idx:end_idx]
-            original_len = actions.shape[0]
+            # ORIGINAL LOGIC: Use pre-recorded action from HDF5 file.
+            if self.horizon == 1:
+                # Single-step action
+                action = self.h5file['action'][idx]
+                lerobot_sample["action"] = torch.from_numpy(action.astype(np.float32))
+                # No padding for single-step
+                lerobot_sample["action_is_pad"] = torch.tensor([False], dtype=torch.bool)
+            else:
+                # Multi-step action chunk
+                end_idx = min(idx + self.horizon, self.num_frames)
+                actions = self.h5file['action'][idx:end_idx]
+                original_len = actions.shape[0]
 
-            # Pad if necessary
-            if actions.shape[0] < self.horizon:
-                padding = np.repeat(actions[-1:], self.horizon - actions.shape[0], axis=0)
-                actions = np.concatenate([actions, padding], axis=0)
+                # Pad if necessary
+                if actions.shape[0] < self.horizon:
+                    padding = np.repeat(actions[-1:], self.horizon - actions.shape[0], axis=0)
+                    actions = np.concatenate([actions, padding], axis=0)
 
-            # Create action_is_pad mask
-            action_is_pad = torch.zeros(self.horizon, dtype=torch.bool)
-            if original_len < self.horizon:
-                action_is_pad[original_len:] = True  # Mark padded indices as True
+                # Create action_is_pad mask
+                action_is_pad = torch.zeros(self.horizon, dtype=torch.bool)
+                if original_len < self.horizon:
+                    action_is_pad[original_len:] = True
 
-            lerobot_sample["action"] = torch.from_numpy(actions.astype(np.float32))
-            lerobot_sample["action_is_pad"] = action_is_pad
+                lerobot_sample["action"] = torch.from_numpy(actions.astype(np.float32))
+                lerobot_sample["action_is_pad"] = action_is_pad
 
         # Add language tokens if tokenizer is available
         if self.task_tokens is not None:
@@ -426,6 +468,7 @@ def create_hdf5_lerobot_dataset(
     n_obs_steps: int = 1,
     use_qpos: bool = False,
     use_ee_pose: bool = True,
+    use_ee_pose_delta_as_action: bool = False,
     task_instruction: str = "Insert the needle into the target point",
     camera_dropout_prob: float = 0.0,
     min_cameras: int = 1,
@@ -448,6 +491,7 @@ def create_hdf5_lerobot_dataset(
         n_obs_steps: Number of observation steps (temporal stacking)
         use_qpos: Use joint positions for state
         use_ee_pose: Use end-effector pose for state (default)
+        use_ee_pose_delta_as_action: Calculate action from ee_pose delta
         task_instruction: Task instruction text
         camera_dropout_prob: Probability of dropping out cameras
         min_cameras: Minimum number of cameras to keep active
@@ -483,6 +527,7 @@ def create_hdf5_lerobot_dataset(
                 n_obs_steps=n_obs_steps,
                 use_qpos=use_qpos,
                 use_ee_pose=use_ee_pose,
+                use_ee_pose_delta_as_action=use_ee_pose_delta_as_action,
                 task_instruction=task_instruction,
                 camera_dropout_prob=camera_dropout_prob,
                 min_cameras=min_cameras,
@@ -570,7 +615,7 @@ if __name__ == "__main__":
     print("🧪 Testing HDF5 LeRobot Adapter...\n")
 
     # Test with a single episode
-    test_file = "/home/irom/NAS/VLA/Insertion_VLAv4/New_dataset/collected_data/episode_20251222_225152.h5"
+    test_file = "/home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260106/2_JYT/episode_20260106_134625_trimmed_0_556.h5"
 
     try:
         dataset = HDF5LeRobotDataset(

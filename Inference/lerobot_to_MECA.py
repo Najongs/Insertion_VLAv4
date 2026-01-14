@@ -26,6 +26,11 @@ import mecademicpy.tools as tools
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.utils.utils import get_safe_torch_device, init_logging
 
+# Add Train directory to path for normalization utils
+train_dir = pathlib.Path(__file__).parent.parent / "Train"
+sys.path.insert(0, str(train_dir))
+from normalization_utils import Normalizer
+
 init_logging()
 logger = logging.getLogger(__name__)
 
@@ -73,11 +78,12 @@ ENABLE_TIME_SCALE = False  # Set to True to use legacy time scaling (NOT recomme
 TIME_SCALE = 15.0 / 8.0 if ENABLE_TIME_SCALE else 1.0  # = 1.875 (data_collection_hz / inference_hz)
 
 # Action Normalization Configuration
-# IMPORTANT: If you know your dataset statistics, set these to the actual min/max values
-# from your training data. Otherwise, leave at None to use model output directly.
-# You can extract these using: python scripts/extract_dataset_stats.py
-DATA_ACTION_MIN = None  # Example: np.array([-2.0, -2.0, -1.0, -5.0, -5.0, -5.0])
-DATA_ACTION_MAX = None  # Example: np.array([2.0, 2.0, 1.0, 5.0, 5.0, 5.0])
+# DEPRECATED: Now handled automatically by loading normalization stats from checkpoint
+# If the checkpoint was trained with normalization (has 'normalization_stats' key),
+# normalization will be applied automatically during inference.
+# Legacy checkpoints without normalization stats will run in legacy mode (no normalization).
+DATA_ACTION_MIN = None  # DEPRECATED - kept for backward compatibility
+DATA_ACTION_MAX = None  # DEPRECATED - kept for backward compatibility
 
 # Action Smoothing Configuration
 ENABLE_EMA_FILTER = True  # Enable Exponential Moving Average filter
@@ -559,7 +565,7 @@ def load_trained_checkpoint(checkpoint_path: str, device: torch.device):
     """
     logger.info(f"Loading trained checkpoint from: {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Extract policy state dict
     policy_state_dict = checkpoint.get("policy_state_dict")
@@ -617,11 +623,26 @@ def load_trained_checkpoint(checkpoint_path: str, device: torch.device):
 
     logger.info(colored("Trained checkpoint loaded successfully!", "green"))
 
+    # Load normalization stats if available
+    normalizer = None
+    if "normalization_stats" in checkpoint:
+        logger.info("Loading normalization statistics from checkpoint...")
+        stats = checkpoint["normalization_stats"]
+        normalizer = Normalizer(stats).to(device)
+        logger.info("Normalizer created successfully")
+        logger.info(f"  Action mean: {stats['action']['mean'][:3]}...")
+        logger.info(f"  Action std:  {stats['action']['std'][:3]}...")
+        logger.info(f"  State mean:  {stats['observation.state']['mean'][:3]}...")
+        logger.info(f"  State std:   {stats['observation.state']['std'][:3]}...")
+    else:
+        logger.warning("No normalization stats found in checkpoint")
+        logger.warning("Inference will run WITHOUT normalization (legacy mode)")
+
     # Move to device
     policy.to(device)
     policy.eval()
 
-    return policy
+    return policy, normalizer
 
 
 def draw_action_graph(action_history: List[np.ndarray], width: int = 800, height: int = 400) -> np.ndarray:
@@ -734,7 +755,8 @@ def create_observation(
     robot_state: np.ndarray,
     num_cameras: int,
     device: torch.device,
-    instruction: str
+    instruction: str,
+    normalizer: Optional[Normalizer] = None
 ) -> Dict:
     """Create observation dictionary for VLA policy.
 
@@ -744,6 +766,7 @@ def create_observation(
         num_cameras: Number of cameras.
         device: Torch device.
         instruction: Task instruction string.
+        normalizer: Optional normalizer for state normalization.
 
     Returns:
         Observation dictionary for policy inference.
@@ -777,8 +800,13 @@ def create_observation(
         for i, cam_key in enumerate(cam_keys):
             observation[f"observation.images.{cam_key}"] = frame_tensor[i:i+1]
 
-    # Add robot state
+    # Add robot state (with normalization if available)
     state_tensor = torch.from_numpy(robot_state).float().to(device).unsqueeze(0)
+
+    # Apply normalization to state if normalizer is available
+    if normalizer is not None:
+        state_tensor = normalizer.normalize(state_tensor, 'observation.state')
+
     observation["observation.state"] = state_tensor
 
     # Add task and robot type
@@ -806,6 +834,7 @@ def main():
             logger.info(f"Using device: {device}")
 
             # Load model
+            normalizer = None  # Will be set if normalization is available
             if USE_HF_MODEL:
                 logger.info(f"Loading Hugging Face model from: {MODEL_PATH}")
                 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
@@ -828,9 +857,10 @@ def main():
                 policy.to(device)
                 policy.eval()
                 logger.info(colored("Hugging Face model loaded successfully!", "green"))
+                logger.warning("HF model loaded - no normalization stats available")
             else:
                 logger.info(f"Loading trained checkpoint: {CHECKPOINT_PATH}")
-                policy = load_trained_checkpoint(CHECKPOINT_PATH, device)
+                policy, normalizer = load_trained_checkpoint(CHECKPOINT_PATH, device)
 
             # Generate task instruction (matching training data format)
             instruction = generate_instruction(TARGET_COLOR)
@@ -885,7 +915,7 @@ def main():
                 warmup_frames = camera_manager.get_frames()
                 if len(warmup_frames) >= num_cameras:
                     warmup_state = robot_manager.get_state()
-                    warmup_obs = create_observation(warmup_frames, warmup_state, num_cameras, device, instruction)
+                    warmup_obs = create_observation(warmup_frames, warmup_state, num_cameras, device, instruction, normalizer)
                     with torch.inference_mode():
                         _ = policy.select_action(preprocessor(warmup_obs))
                     logger.info("Warmup complete")
@@ -949,7 +979,7 @@ def main():
                     if ENABLE_PROFILING:
                         t0 = time.time()
                     robot_state = robot_manager.get_state()
-                    observation = create_observation(frames, robot_state, num_cameras, device, instruction)
+                    observation = create_observation(frames, robot_state, num_cameras, device, instruction, normalizer)
                     if ENABLE_PROFILING:
                         t_obs_build = time.time() - t0
 
@@ -975,14 +1005,36 @@ def main():
                     if ENABLE_PROFILING:
                         t_postprocess = time.time() - t0
 
-                    # Extract and scale action
+                    # Extract action (still normalized if normalizer was used)
                     if isinstance(action, dict) and "action" in action:
-                        action_np = action["action"].cpu().numpy()
+                        action_tensor = action["action"]
                     elif isinstance(action, torch.Tensor):
-                        action_np = action.cpu().numpy()
+                        action_tensor = action
                     else:
                         logger.error(f"Unexpected action format: {type(action)}")
                         continue
+
+                    # Unnormalize action if normalizer is available
+                    if normalizer is not None:
+                        # Keep on GPU for unnormalization
+                        if action_tensor.ndim == 3:
+                            # Batched chunk: (1, chunk_size, 6)
+                            batch_size, chunk_size, action_dim = action_tensor.shape
+                            # Reshape to (batch * chunk, action_dim)
+                            action_flat = action_tensor.reshape(-1, action_dim)
+                            # Unnormalize
+                            action_unnorm = normalizer.unnormalize(action_flat, 'action')
+                            # Reshape back
+                            action_tensor = action_unnorm.reshape(batch_size, chunk_size, action_dim)
+                        elif action_tensor.ndim == 2:
+                            # (chunk_size, 6) or (1, 6)
+                            action_tensor = normalizer.unnormalize(action_tensor, 'action')
+                        else:
+                            # (6,)
+                            action_tensor = normalizer.unnormalize(action_tensor, 'action')
+
+                    # Now convert to numpy
+                    action_np = action_tensor.cpu().numpy()
 
                     # Handle action shape
                     # action_np can be:

@@ -52,7 +52,7 @@ def load_checkpoint_info(checkpoint_path: str) -> Dict:
     """
     logger.info(f"Loading checkpoint: {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     info = {
         "step": checkpoint.get("step", "unknown"),

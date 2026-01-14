@@ -23,10 +23,10 @@ output_dir: "outputs/train/smolvla_needle_insertion"
 # ---------------------
 dataset:
   # Root directory containing HDF5 episode files
-  root_dir: "/home/najo/NAS/VLA/dataset/New_dataset/collected_data/Red_point"
+  root_dir: "/home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar"
 
   # Action prediction horizon (SmolVLA uses action chunks)
-  horizon: 50
+  horizon: 50  # FIXED from 10 to match SmolVLA default
 
   # State representation
   use_qpos: false        # Use joint positions (6 dims)
@@ -37,7 +37,7 @@ dataset:
 
   # Data Augmentation
   # -----------------
-  augment: true
+  augment: false
   augment_brightness: 0.15       # Max brightness change (±15%)
   augment_contrast: 0.15         # Max contrast change (±15%)
   augment_saturation: 0.10       # Saturation change (±10%)
@@ -52,8 +52,8 @@ policy:
 
   # Observation and action
   n_obs_steps: 1         # Number of observation steps (SmolVLA uses single observation)
-  chunk_size: 50         # Action chunk size (action horizon)
-  n_action_steps: 50     # Number of action steps to execute
+  chunk_size: 50         # Action chunk size (action horizon) - FIXED from 10
+  n_action_steps: 50     # Number of action steps to execute - FIXED from 10
 
   # Dimensions
   max_state_dim: 32      # Maximum state dimension (padded)
@@ -107,27 +107,35 @@ lora:
 # ----------------------
 training:
   # Training steps
-  steps: 30000           # 30k steps (typical training length)
+  steps: 10000           # 30k steps (typical training length)
 
   # Batch size
-  batch_size: 4          # Per-GPU batch size (effective=20 with 5 GPUs)
+  batch_size: 8          # Per-GPU batch size (=30 with 5 GPUs)
+
+  # Gradient Accumulation (for larger effective batch size)
+  gradient_accumulation_steps: 1  # Effective batch size = 30 * 3 = 90
 
   # DataLoader settings
-  num_workers: 4
-  pin_memory: true
+  num_workers: 0         # Use 0 workers to avoid RAM OOM with multi-GPU (5 GPUs × workers = too many processes)
+  pin_memory: true       # Enable for faster CPU-to-GPU transfer
 
   # Logging and saving
   log_freq: 100          # Log every N steps
-  save_freq: 5000        # Save checkpoint every N steps
+  save_freq: 1000        # Save checkpoint every N steps (reduced from 5000 for faster checkpointing)
 
   # Temporal consistency loss weight
   # This encourages smooth action trajectories (matching inference smoothing)
   lambda_temporal: 0.1   # Weight for temporal consistency loss (0.0 = disabled)
 
+  # Mixed Precision Training
+  # DISABLED: SmolVLA uses BFloat16 internally which conflicts with GradScaler
+  # Other optimizations (batch size, gradient accumulation, workers) provide sufficient speedup
+  use_amp: false         # Disabled due to BFloat16 incompatibility
+
 # Optimizer Configuration
 # -----------------------
 optimizer:
-  lr: 0.0001             # Learning rate (1e-4, SmolVLA default)
+  lr: 0.0001             # Learning rate (1e-4, SmolVLA default) - FIXED from 1e-5
   betas: [0.9, 0.95]     # Adam betas
   weight_decay: 0.0000000001  # Weight decay (1e-10, SmolVLA default)
   eps: 0.00000001        # Adam epsilon (1e-8)
@@ -136,10 +144,10 @@ optimizer:
 # Scheduler Configuration
 # -----------------------
 scheduler:
-  num_warmup_steps: 1000      # Warmup steps
-  num_decay_steps: 30000      # Decay steps (matches training steps)
-  peak_lr: 0.0001             # Peak learning rate (1e-4)
-  decay_lr: 0.0000025         # Final learning rate (2.5e-6)
+  num_warmup_steps: 500     # Warmup steps (10% of total) - FIXED from 100
+  num_decay_steps: 10000     # Decay steps (matches training steps)
+  peak_lr: 0.0001            # Peak learning rate (1e-4, matches optimizer.lr) - FIXED
+  decay_lr: 0.0000025        # Final learning rate (2.5e-6) - FIXED from 2.5e-9
 
 # W&B (Weights & Biases) Configuration
 # ------------------------------------
