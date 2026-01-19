@@ -1,0 +1,7 @@
+action_mse_mean: 0.02977340668439865
+action_mse_std: 0.03518540412187576
+num_frames: 349
+position_mse_mean: 0.05436442047357559
+position_mse_std: 0.06815410405397415
+rotation_mse_mean: 0.0051823873072862625
+rotation_mse_std: 0.00939102191478014

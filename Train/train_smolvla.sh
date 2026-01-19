@@ -16,12 +16,36 @@
 #
 # Usage:
 #   bash train_smolvla.sh
+#   bash train_smolvla.sh --resume /path/to/checkpoint.pt
+#   bash train_smolvla.sh --resume /path/to/checkpoint.pt --reset_scheduler
 #
 # To specify GPUs:
 #   CUDA_VISIBLE_DEVICES=0,1,2,3,4 bash train_smolvla.sh
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4 bash train_smolvla.sh --resume /path/to/checkpoint.pt --reset_scheduler
 # =============================================================================
 
 set -e  # Exit on error
+
+# Parse command line arguments
+RESUME_CHECKPOINT=""
+RESET_SCHEDULER=false
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --resume)
+            RESUME_CHECKPOINT="$2"
+            shift 2
+            ;;
+        --reset_scheduler)
+            RESET_SCHEDULER=true
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: bash train_smolvla.sh [--resume /path/to/checkpoint.pt] [--reset_scheduler]"
+            exit 1
+            ;;
+    esac
+done
 
 # Change to script directory
 cd "$(dirname "$0")"
@@ -80,7 +104,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 # Create output directory
-OUTPUT_DIR="outputs/train/smolvla_needle_insertion"
+OUTPUT_DIR="outputs/train/smolvla_needle_insertion_new"
 mkdir -p "$OUTPUT_DIR"
 
 # Create logs directory
@@ -104,6 +128,14 @@ echo "  Training steps: $STEPS"
 echo "  Learning rate: $LR"
 echo "  Output directory: $OUTPUT_DIR"
 echo "  Log file: $LOG_FILE"
+if [ -n "$RESUME_CHECKPOINT" ]; then
+    echo "  Resume from: $RESUME_CHECKPOINT"
+    if [ "$RESET_SCHEDULER" = true ]; then
+        echo "  Reset scheduler: YES (fresh warmup from current step)"
+    else
+        echo "  Reset scheduler: NO (continue with checkpoint scheduler)"
+    fi
+fi
 echo ""
 echo "Expert-Only Training Benefits:"
 echo "  ✓ Only action expert trained (~100-200M params)"
@@ -134,6 +166,16 @@ echo "Press Ctrl+C to stop"
 echo ""
 
 # Run training with torchrun
+RESUME_ARG=""
+if [ -n "$RESUME_CHECKPOINT" ]; then
+    RESUME_ARG="--resume $RESUME_CHECKPOINT"
+fi
+
+RESET_SCHEDULER_ARG=""
+if [ "$RESET_SCHEDULER" = true ]; then
+    RESET_SCHEDULER_ARG="--reset_scheduler"
+fi
+
 PYTHONPATH=/home/najo/NAS/VLA/Insertion_VLAv4/lerobot/src:$PYTHONPATH \
 torchrun \
     --standalone \
@@ -145,6 +187,8 @@ torchrun \
     --steps $STEPS \
     --lr $LR \
     --output_dir "$OUTPUT_DIR" \
+    $RESUME_ARG \
+    $RESET_SCHEDULER_ARG \
     2>&1 | tee "$LOG_FILE"
 
 # Store exit code

@@ -84,6 +84,34 @@ policy:
   # VLM layers (paper: first 16 layers only)
   num_vlm_layers: 16
 
+
+lora:
+  # Enable LoRA (EXPERIMENTAL - may not work with SmolVLA)
+  enable: false
+
+  # LoRA rank (controls number of trainable parameters)
+  # Higher rank = more parameters = better performance but more memory
+  lora_r: 8              # Typical values: 4, 8, 16, 32
+
+  # LoRA alpha (scaling factor)
+  # Typically set to 2x the rank
+  lora_alpha: 16         # Typical: 2 * lora_r
+
+  # LoRA dropout (regularization)
+  lora_dropout: 0.05     # Typical: 0.05-0.1
+
+  # Target modules (which layers to apply LoRA)
+  # Targeting attention and MLP layers for maximum impact
+  target_modules:
+    - "q_proj"           # Query projection
+    - "v_proj"           # Value projection
+    - "k_proj"           # Key projection
+    - "o_proj"           # Output projection
+    - "gate_proj"        # MLP gate projection
+    - "up_proj"          # MLP up projection
+    - "down_proj"        # MLP down projection
+
+
 # Training Configuration (Paper Settings for Fine-tuning)
 # --------------------------------------------------------
 training:
@@ -109,6 +137,9 @@ training:
   # Temporal consistency loss weight
   lambda_temporal: 0.1
 
+  # Loss spike detection (logs batches with abnormally high loss)
+  loss_spike_threshold: 3.0  # Multiplier of moving average (e.g., 3.0 = log if loss > 3x avg)
+
   # Mixed Precision Training (paper: bfloat16)
   # Note: Use bfloat16 instead of float16 for better numerical stability
   use_amp: false         # Disabled, will use bfloat16 directly in policy
@@ -116,6 +147,18 @@ training:
 
   # Torch optimizations (paper: torch.compile)
   use_torch_compile: false  # Set to true for faster training (requires PyTorch 2.0+)
+
+# Validation Configuration
+# -------------------------
+validation:
+  # Enable validation during training
+  enable: true
+
+  # Number of episodes to use for validation
+  num_episodes: 10
+
+  # Validation frequency (every N steps)
+  val_freq: 1000
 
 # Optimizer Configuration (Paper Settings)
 # -----------------------------------------
