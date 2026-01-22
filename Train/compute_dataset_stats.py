@@ -7,8 +7,8 @@ for use in normalized training and evaluation.
 
 Usage:
 python compute_dataset_stats.py \
-    --dataset_root /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar \
-    --output dataset_stats.yaml \
+    --dataset_root /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar_sim \
+    --output dataset_stats_sim.yaml \
     --max_episodes 1000
 """
 

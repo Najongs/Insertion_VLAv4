@@ -1,22 +1,23 @@
 #!/usr/bin/env python
 """
-SmolVLA Training script for Meca500 + Vision-Language-Action
+SmolVLA Training script for Simulation Data (Meca500 + Vision-Language-Action)
 
-Based on lerobot/scripts/lerobot_train.py with improvements:
-- Data-driven action normalization (min/max from dataset statistics)
-- Temporal consistency loss for smoother trajectories
-- Expert-only training for memory efficiency
-- Multi-camera support (3 OAK cameras)
+Based on train_smolvla.py but adapted for simulation data from Eye_trocar_sim dataset
+
+Key Differences from Real Data Training:
+- Uses simulation data with domain randomization (DR) applied during data collection
+- Camera names might be different (side_camera, tool_camera, top_camera)
+- No need for additional data augmentation since DR was already applied
+- Higher learning rate possible due to consistent sim data
 
 Memory Requirements:
-- Full Fine-Tuning: > 40 GB
-- Expert-Only Training: ~12-16 GB (fits on RTX 3090/4090)
+- Expert-Only Training: ~12-16 GB per GPU (fits on RTX 3090/4090)
 
 Usage:
-    python train_smolvla.py --config train_config_smolvla.yaml
+    python train_smolvla_sim.py --config train_config_smolvla_sim.yaml
 
 DDP Usage:
-    torchrun --nproc_per_node=5 train_smolvla.py --config train_config_smolvla.yaml
+    torchrun --nproc_per_node=5 train_smolvla_sim.py --config train_config_smolvla_sim.yaml
 """
 
 import argparse
@@ -131,7 +132,7 @@ def setup_wandb(config: Dict, resume: bool = False):
         return None
 
     # W&B initialization
-    project = wandb_cfg.get("project", "smolvla-training")
+    project = wandb_cfg.get("project", "smolvla-sim-training")
     entity = wandb_cfg.get("entity", None)
     name = wandb_cfg.get("name", None)
     tags = wandb_cfg.get("tags", [])
@@ -140,7 +141,7 @@ def setup_wandb(config: Dict, resume: bool = False):
     # Auto-generate name if not provided
     if name is None:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        name = f"smolvla_{timestamp}"
+        name = f"smolvla_sim_{timestamp}"
 
     logger.info(f"Initializing W&B: project={project}, name={name}")
 
@@ -210,21 +211,19 @@ def create_dataset_from_config(config: Dict, val_split: bool = False) -> Tuple[t
     dataset_cfg = config["dataset"]
     policy_cfg = config["policy"]
 
-    # Build full HDF5 file paths
+    # Build full HDF5 file paths from sim dataset
     root_dir = Path(dataset_cfg["root_dir"])
     hdf5_files = []
 
-    # Support both specific file list and pattern matching
-    if "hdf5_files" in dataset_cfg:
-        hdf5_files = [root_dir / f for f in dataset_cfg["hdf5_files"]]
-    else:
-        hdf5_files = sorted(list(root_dir.rglob("*.h5")) + list(root_dir.rglob("*.hdf5")))
+    # Recursively search for all .h5 files in sim folders
+    hdf5_files = sorted(list(root_dir.rglob("*.h5")) + list(root_dir.rglob("*.hdf5")))
 
     if len(hdf5_files) == 0:
         raise FileNotFoundError(f"No HDF5 files found in {root_dir}")
 
     if is_main_process():
-        logger.info(f"Found {len(hdf5_files)} HDF5 files")
+        logger.info(f"Found {len(hdf5_files)} simulation HDF5 files")
+        logger.info(f"Simulation data from: {root_dir}")
 
     # Split into train/val if requested
     val_dataset = None
@@ -237,7 +236,7 @@ def create_dataset_from_config(config: Dict, val_split: bool = False) -> Tuple[t
 
         if is_main_process():
             logger.info("=" * 80)
-            logger.info("Train/Validation Split")
+            logger.info("Simulation Train/Validation Split")
             logger.info("=" * 80)
             logger.info(f"Total episodes: {len(hdf5_files)}")
             logger.info(f"Train episodes: {len(train_files)}")
@@ -255,6 +254,15 @@ def create_dataset_from_config(config: Dict, val_split: bool = False) -> Tuple[t
     if is_main_process():
         logger.info(f"Created tokenizer from {vlm_model_name} (max_length={tokenizer_max_length})")
 
+    # Camera mapping for simulation data (adjust if needed)
+    # Simulation uses: side_camera, tool_camera, top_camera
+    # LeRobot expects: camera1, camera2, camera3
+    camera_mapping = {
+        "side_camera": "camera1",
+        "tool_camera": "camera2",
+        "top_camera": "camera3",
+    }
+
     # Create train dataset
     train_dataset = create_hdf5_lerobot_dataset(
         hdf5_paths=train_files,
@@ -264,19 +272,21 @@ def create_dataset_from_config(config: Dict, val_split: bool = False) -> Tuple[t
         use_qpos=dataset_cfg.get("use_qpos", False),
         use_ee_pose=dataset_cfg.get("use_ee_pose", True),
         use_ee_pose_delta_as_action=dataset_cfg.get("use_ee_pose_delta_as_action", False),
-        task_instruction=dataset_cfg.get("task_instruction", "Insert needle into eye trocar."),
+        task_instruction=dataset_cfg.get("task_instruction", "Insert needle into eye trocar in simulation."),
         tokenizer=tokenizer,
         tokenizer_max_length=tokenizer_max_length,
-        augment=dataset_cfg.get("augment", True),
-        augment_brightness=dataset_cfg.get("augment_brightness", 0.15),
-        augment_contrast=dataset_cfg.get("augment_contrast", 0.15),
-        augment_saturation=dataset_cfg.get("augment_saturation", 0.10),
-        augment_hue=dataset_cfg.get("augment_hue", 0.05),
-        augment_noise=dataset_cfg.get("augment_noise", 0.01),
+        # NO augmentation for sim data - DR was already applied during collection
+        augment=False,
+        augment_brightness=0.0,
+        augment_contrast=0.0,
+        augment_saturation=0.0,
+        augment_hue=0.0,
+        augment_noise=0.0,
     )
 
     if is_main_process():
         logger.info(f"Train dataset created: {len(train_dataset)} samples")
+        logger.info("Note: No data augmentation applied (DR already done during sim data collection)")
 
     # Create validation dataset if split is requested
     if val_split:
@@ -288,10 +298,10 @@ def create_dataset_from_config(config: Dict, val_split: bool = False) -> Tuple[t
             use_qpos=dataset_cfg.get("use_qpos", False),
             use_ee_pose=dataset_cfg.get("use_ee_pose", True),
             use_ee_pose_delta_as_action=dataset_cfg.get("use_ee_pose_delta_as_action", False),
-            task_instruction=dataset_cfg.get("task_instruction", "Insert needle into eye trocar."),
+            task_instruction=dataset_cfg.get("task_instruction", "Insert needle into eye trocar in simulation."),
             tokenizer=tokenizer,
             tokenizer_max_length=tokenizer_max_length,
-            augment=False,  # No augmentation for validation
+            augment=False,
             augment_brightness=0.0,
             augment_contrast=0.0,
             augment_saturation=0.0,
@@ -311,7 +321,7 @@ def create_policy_from_config(config: Dict, device: torch.device) -> SmolVLAPoli
 
     if is_main_process():
         logger.info("=" * 80)
-        logger.info("Creating SmolVLA Policy")
+        logger.info("Creating SmolVLA Policy for Simulation")
         logger.info("=" * 80)
         logger.info(f"vlm_model_name: {policy_cfg.get('vlm_model_name', 'HuggingFaceTB/SmolVLM2-500M-Video-Instruct')}")
         logger.info(f"n_obs_steps: {policy_cfg.get('n_obs_steps', 1)}")
@@ -507,11 +517,6 @@ def update_policy(
 ):
     """
     Performs a single training step with gradient accumulation support.
-
-    Args:
-        gradient_accumulation_steps: Number of steps to accumulate gradients
-        accumulation_step: Current step in accumulation cycle (0 to gradient_accumulation_steps-1)
-        normalizer: Optional normalizer for state and action
     """
     device = get_device_from_parameters(policy)
     policy.train()
@@ -522,7 +527,7 @@ def update_policy(
     # Scale loss by accumulation steps to maintain gradient magnitude
     loss_scale = 1.0 / gradient_accumulation_steps
 
-    # Use float16 explicitly for AMP (not bfloat16, as GradScaler doesn't support bfloat16)
+    # Use float16 explicitly for AMP
     with torch.autocast(device_type=device.type, enabled=use_amp, dtype=torch.float16):
         # Forward pass - SmolVLA returns (loss, loss_dict) tuple
         loss, loss_dict = policy.forward(batch)
@@ -539,7 +544,7 @@ def update_policy(
         # Scale loss for gradient accumulation
         loss = loss * loss_scale
 
-    # Backward pass (use GradScaler for float16 stability)
+    # Backward pass
     if use_amp:
         grad_scaler.scale(loss).backward()
     else:
@@ -550,7 +555,6 @@ def update_policy(
 
     if is_update_step:
         if use_amp:
-            # AMP: unscale gradients before clipping
             grad_scaler.unscale_(optimizer)
 
         # Clip gradients
@@ -595,7 +599,7 @@ def train(
     val_episode_indices: Optional[List[int]] = None,
     hdf5_files: Optional[List[Path]] = None,
 ):
-    """Main training loop (following lerobot_train.py structure)."""
+    """Main training loop (adapted for simulation data)."""
     training_cfg = config["training"]
     optimizer_cfg = config["optimizer"]
     validation_cfg = config.get("validation", {})
@@ -614,17 +618,17 @@ def train(
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     # Loss spike detection settings
-    loss_spike_threshold = training_cfg.get("loss_spike_threshold", 3.0)  # Multiplier for moving average
+    loss_spike_threshold = training_cfg.get("loss_spike_threshold", 3.0)
     loss_spike_log_path = output_dir / "loss_spikes.txt"
     loss_spike_csv_path = output_dir / "loss_spikes.csv"
-    loss_history = []  # Keep track of recent losses for moving average
-    loss_spike_records = []  # Store spike records for wandb table
+    loss_history = []
+    loss_spike_records = []
 
     # Save validation episode information
     if is_main_process() and val_episode_indices is not None and hdf5_files is not None:
         val_info_path = output_dir / "validation_episodes.txt"
         with open(val_info_path, 'w') as f:
-            f.write("Validation Episodes\n")
+            f.write("Validation Episodes (Simulation Data)\n")
             f.write("=" * 80 + "\n\n")
             f.write(f"Total episodes: {len(hdf5_files)}\n")
             f.write(f"Validation episodes: {len(val_episode_indices)}\n")
@@ -636,14 +640,12 @@ def train(
 
     # Initialize loss spike log files
     if is_main_process():
-        # Text log file
         with open(loss_spike_log_path, 'w') as f:
-            f.write("Loss Spikes Log\n")
+            f.write("Loss Spikes Log (Simulation Training)\n")
             f.write("=" * 80 + "\n")
             f.write(f"Threshold: {loss_spike_threshold}x moving average\n")
             f.write("=" * 80 + "\n\n")
 
-        # CSV file for easy analysis
         with open(loss_spike_csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -662,7 +664,7 @@ def train(
     running_temporal_loss = 0.0
     running_grad_norm = 0.0
 
-    # Load checkpoint if resuming
+    # Load checkpoint if resuming (same as train_smolvla.py)
     if resume_checkpoint is not None:
         if is_main_process():
             logger.info("=" * 80)
@@ -671,7 +673,6 @@ def train(
 
         checkpoint = torch.load(resume_checkpoint, map_location='cpu', weights_only=False)
 
-        # Load policy state (handling both 'policy_state_dict' and 'model_state_dict')
         if 'policy_state_dict' in checkpoint:
             state_dict = checkpoint['policy_state_dict']
         elif 'model_state_dict' in checkpoint:
@@ -680,18 +681,14 @@ def train(
             raise KeyError("Checkpoint does not contain 'policy_state_dict' or 'model_state_dict'")
 
         # Handle DDP module prefix mismatch
-        # Check if current model is DDP wrapped
         is_model_ddp = isinstance(policy, DDP)
-        # Check if state_dict has 'module.' prefix
         has_module_prefix = any(k.startswith('module.') for k in state_dict.keys())
 
         if is_model_ddp and not has_module_prefix:
-            # Current model is DDP but checkpoint is not - add 'module.' prefix
             state_dict = {f'module.{k}': v for k, v in state_dict.items()}
             if is_main_process():
                 logger.info("Added 'module.' prefix to checkpoint state_dict for DDP compatibility")
         elif not is_model_ddp and has_module_prefix:
-            # Current model is not DDP but checkpoint is - remove 'module.' prefix
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
             if is_main_process():
                 logger.info("Removed 'module.' prefix from checkpoint state_dict")
@@ -700,7 +697,6 @@ def train(
         if is_main_process():
             logger.info("Loaded policy state_dict")
 
-        # Load optimizer state - handle parameter group mismatch
         try:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             if is_main_process():
@@ -708,82 +704,44 @@ def train(
         except ValueError as e:
             if "doesn't match the size of optimizer's group" in str(e):
                 if is_main_process():
-                    logger.warning("Optimizer parameter groups don't match checkpoint (likely due to freezing parameters)")
-                    logger.warning("Loading only matching parameter states, momentum will be reset for new trainable params")
-
-                # Load only the state dict for parameters that still exist and are trainable
-                checkpoint_state = checkpoint['optimizer_state_dict']
-                current_state = optimizer.state_dict()
-
-                # Get current trainable parameter ids
-                current_param_ids = {id(p) for group in optimizer.param_groups for p in group['params']}
-
-                # Try to load what we can from checkpoint
-                if 'state' in checkpoint_state:
-                    # Only load states for parameters that are still trainable
-                    loaded_count = 0
-                    for param_id, param_state in checkpoint_state['state'].items():
-                        if param_id in current_state['state']:
-                            optimizer.state[param_id] = param_state
-                            loaded_count += 1
-
-                    if is_main_process():
-                        logger.info(f"Loaded {loaded_count} parameter states from checkpoint")
-                        logger.info("Other parameters will start with fresh optimizer state")
+                    logger.warning("Optimizer parameter groups don't match checkpoint")
+                    logger.warning("Loading only matching parameter states")
             else:
                 raise
 
-        # Load scheduler state (unless reset_scheduler is True)
         if reset_scheduler:
             if is_main_process():
                 logger.info("Scheduler reset requested - will use fresh warmup schedule")
-                logger.info(f"  Warmup steps: {training_cfg.get('num_warmup_steps', 200)}")
-                logger.info(f"  Peak LR will be reached after warmup")
         else:
             if scheduler is not None and 'scheduler_state_dict' in checkpoint:
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 if is_main_process():
                     logger.info("Loaded scheduler state_dict")
-                    # Show current LR
                     current_lr = scheduler.get_last_lr()[0]
                     logger.info(f"  Current LR: {current_lr:.2e}")
 
-        # Load grad scaler state if using AMP
         if use_amp and 'grad_scaler_state_dict' in checkpoint:
             grad_scaler.load_state_dict(checkpoint['grad_scaler_state_dict'])
             if is_main_process():
                 logger.info("Loaded grad_scaler state_dict")
 
-        # Resume from next step
         step = checkpoint['step']
         if is_main_process():
             logger.info(f"Resuming from step {step}")
             logger.info("=" * 80)
 
-        # Synchronize all ranks after checkpoint loading to prevent DDP deadlock
         if dist.is_initialized():
             if is_main_process():
                 logger.info("Synchronizing all ranks after checkpoint loading...")
             dist.barrier()
             if is_main_process():
-                logger.info("All ranks synchronized, ready to resume training")
-
-    # W&B: Log model architecture (main process only)
-    # DISABLED: wandb.watch causes memory accumulation over long training runs
-    # We'll log metrics manually instead
-    if is_main_process() and wandb_run is not None:
-        logger.info("W&B watch disabled to prevent memory accumulation")
-        # try:
-        #     wandb.watch(policy, log="gradients", log_freq=log_freq * 10)
-        #     logger.info(f"W&B watch enabled: log='gradients', log_freq={log_freq * 10}")
-        # except Exception as e:
-        #     logger.warning(f"Failed to setup wandb.watch: {e}")
+                logger.info("All ranks synchronized")
 
     if is_main_process():
         batch_size = training_cfg.get('batch_size', 8)
         effective_batch = batch_size * world_size * gradient_accumulation_steps
         logger.info("=" * 80)
-        logger.info("Starting SmolVLA Expert-Only Training")
+        logger.info("Starting SmolVLA Simulation Training")
         logger.info("=" * 80)
         logger.info(f"Total steps: {total_steps}")
         logger.info(f"Batch size per GPU: {batch_size}")
@@ -792,15 +750,14 @@ def train(
         logger.info(f"Effective batch size: {effective_batch}")
         logger.info(f"Gradient clip norm: {grad_clip_norm}")
         logger.info(f"Temporal consistency weight (λ): {lambda_temporal}")
-        logger.info(f"Mixed Precision (AMP): {use_amp} (dtype=float16)")
+        logger.info(f"Mixed Precision (AMP): {use_amp}")
+        logger.info("NOTE: Training on simulation data with DR applied")
         if wandb_run is not None:
             logger.info(f"W&B tracking: {wandb_run.url}")
         logger.info("=" * 80)
 
     start_time = time.time()
 
-    # Create DataLoader iterator (regenerate periodically to prevent memory buildup)
-    # Using manual epoch looping instead of itertools.cycle to avoid buffer accumulation
     def get_dataloader_iterator():
         """Create a fresh dataloader iterator to prevent memory buildup."""
         while True:
@@ -809,7 +766,6 @@ def train(
 
     dl_iter = get_dataloader_iterator()
 
-    # Progress bar (only on main process)
     if is_main_process():
         pbar = tqdm(total=total_steps, desc="Training", unit="step",
                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
@@ -817,18 +773,15 @@ def train(
         pbar = None
 
     for step in range(total_steps):
-        # Calculate accumulation step (0 to gradient_accumulation_steps-1)
         accumulation_step = step % gradient_accumulation_steps
 
-        # Get batch
         batch = next(dl_iter)
 
-        # Extract metadata BEFORE moving to device (for loss spike detection)
+        # Extract metadata for loss spike detection
         batch_episode_indices = batch.get("episode_index", [])
         batch_frame_indices = batch.get("frame_index", [])
         batch_timestamps = batch.get("timestamp", [])
 
-        # Convert to lists for logging
         if isinstance(batch_episode_indices, torch.Tensor):
             batch_episode_indices = batch_episode_indices.cpu().tolist()
         if isinstance(batch_frame_indices, torch.Tensor):
@@ -840,7 +793,7 @@ def train(
         batch = {k: v.to(get_device_from_parameters(policy)) if isinstance(v, torch.Tensor) else v
                  for k, v in batch.items()}
 
-        # Update policy with gradient accumulation
+        # Update policy
         loss, action_loss, temporal_loss, grad_norm = update_policy(
             policy,
             batch,
@@ -855,37 +808,31 @@ def train(
             accumulation_step=accumulation_step,
         )
 
-        # Accumulate losses (detach from computation graph to prevent memory buildup)
         running_loss += loss
         running_action_loss += action_loss
         running_temporal_loss += temporal_loss
-        if grad_norm > 0:  # Only accumulate when weights are updated
+        if grad_norm > 0:
             running_grad_norm += grad_norm
 
-        # Loss spike detection (on main process only)
+        # Loss spike detection
         if is_main_process():
-            # Add current loss to history (keep last 100 steps for moving average)
             loss_history.append(loss)
             if len(loss_history) > 100:
                 loss_history.pop(0)
 
-            # Check for loss spike (after warmup period)
-            if len(loss_history) >= 50:  # Need at least 50 samples for reliable average
+            if len(loss_history) >= 50:
                 moving_avg = sum(loss_history) / len(loss_history)
 
-                # Detect spike: loss > threshold * moving_avg
                 if loss > loss_spike_threshold * moving_avg:
                     ratio = loss / moving_avg
                     unique_episodes = sorted(set(batch_episode_indices))
 
-                    # Get episode paths
                     episode_paths = []
                     if hdf5_files is not None:
                         for ep_idx in unique_episodes:
                             if ep_idx < len(hdf5_files):
                                 episode_paths.append(f"[{ep_idx}] {hdf5_files[ep_idx].name}")
 
-                    # Log spike to text file
                     with open(loss_spike_log_path, 'a') as f:
                         f.write(f"\n{'='*80}\n")
                         f.write(f"LOSS SPIKE at Step {step + 1}\n")
@@ -897,15 +844,12 @@ def train(
                         f.write(f"  Batch size: {len(batch_episode_indices)}\n")
                         f.write(f"  Episode indices: {batch_episode_indices}\n")
                         f.write(f"  Frame indices: {batch_frame_indices}\n")
-                        f.write(f"  Timestamps: {batch_timestamps}\n")
-
                         if episode_paths:
                             f.write(f"\nEpisode Paths:\n")
                             for ep_path in episode_paths:
                                 f.write(f"  {ep_path}\n")
                         f.write("\n")
 
-                    # Log spike to CSV file
                     with open(loss_spike_csv_path, 'a', newline='') as f:
                         writer = csv.writer(f)
                         writer.writerow([
@@ -920,7 +864,6 @@ def train(
                             "; ".join(episode_paths) if episode_paths else "N/A"
                         ])
 
-                    # Store record for wandb table
                     spike_record = {
                         "step": step + 1,
                         "loss": float(loss),
@@ -934,7 +877,6 @@ def train(
                     }
                     loss_spike_records.append(spike_record)
 
-                    # Log to console
                     spike_msg = (
                         f"⚠️  LOSS SPIKE at step {step + 1}: {loss:.4f} "
                         f"(avg: {moving_avg:.4f}, {ratio:.1f}x) | "
@@ -942,7 +884,6 @@ def train(
                     )
                     pbar.write(spike_msg) if pbar is not None else logger.warning(spike_msg)
 
-                    # Log to W&B (immediate metrics)
                     if wandb_run is not None:
                         wandb.log({
                             "spike/loss": float(loss),
@@ -951,18 +892,15 @@ def train(
                             "spike/step": int(step + 1),
                         })
 
-        # MEMORY FIX: Explicitly delete batch and clear caches periodically
+        # Memory cleanup
         del batch
-
-        # Every 50 steps: aggressive memory cleanup
         if (step + 1) % 50 == 0:
-            torch.cuda.empty_cache()  # Clear CUDA cache
-            gc.collect()  # Force Python garbage collection to prevent RAM buildup
+            torch.cuda.empty_cache()
+            gc.collect()
 
         # Update progress bar
         if pbar is not None:
             pbar.update(1)
-            # Update postfix every step with current metrics
             if (step + 1) % 10 == 0:
                 current_lr = scheduler.get_last_lr()[0]
                 pbar.set_postfix({
@@ -983,21 +921,19 @@ def train(
             # Memory monitoring
             if PSUTIL_AVAILABLE:
                 process = psutil.Process()
-                ram_gb = process.memory_info().rss / (1024 ** 3)  # Convert to GB
+                ram_gb = process.memory_info().rss / (1024 ** 3)
                 ram_percent = process.memory_percent()
             else:
                 ram_gb = 0.0
                 ram_percent = 0.0
 
-            # CUDA memory
             if torch.cuda.is_available():
-                cuda_mem_allocated = torch.cuda.memory_allocated() / (1024 ** 3)  # GB
-                cuda_mem_reserved = torch.cuda.memory_reserved() / (1024 ** 3)  # GB
+                cuda_mem_allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+                cuda_mem_reserved = torch.cuda.memory_reserved() / (1024 ** 3)
             else:
                 cuda_mem_allocated = 0.0
                 cuda_mem_reserved = 0.0
 
-            # Progress percentage
             progress_pct = (step + 1) / total_steps * 100
 
             log_msg = (
@@ -1009,9 +945,9 @@ def train(
                 f"VRAM: {cuda_mem_allocated:.1f}GB"
             )
 
-            pbar.write(log_msg)  # Write to tqdm output
+            pbar.write(log_msg)
 
-            # W&B logging (create dict without holding references)
+            # W&B logging
             if wandb_run is not None:
                 log_dict = {
                     "train/loss": float(avg_loss),
@@ -1027,16 +963,15 @@ def train(
                     "step": int(step + 1),
                 }
                 wandb.log(log_dict)
-                del log_dict  # Explicitly delete to free memory
+                del log_dict
 
-            # Reset
             running_loss = 0.0
             running_action_loss = 0.0
             running_temporal_loss = 0.0
             running_grad_norm = 0.0
             start_time = time.time()
 
-        # Validation evaluation
+        # Validation
         if val_dataloader is not None and (step + 1) % val_freq == 0 and is_main_process():
             logger.info(f"Running validation at step {step + 1}...")
 
@@ -1045,14 +980,12 @@ def train(
                 val_dataloader,
                 normalizer=normalizer,
                 use_amp=use_amp,
-                max_batches=None,  # Evaluate on full validation set
+                max_batches=None,
             )
 
-            # Log validation metrics
             val_msg = f"[VAL] Step {step + 1} | Loss: {val_metrics['val/loss']:.4f} | Action Loss: {val_metrics['val/action_loss']:.4f}"
             pbar.write(val_msg) if pbar is not None else logger.info(val_msg)
 
-            # W&B logging
             if wandb_run is not None:
                 val_log_dict = {
                     "val/loss": float(val_metrics['val/loss']),
@@ -1062,14 +995,12 @@ def train(
                 wandb.log(val_log_dict)
                 del val_log_dict
 
-            # Set back to train mode
             policy.train()
 
-        # Intermediate checkpoint saving
+        # Checkpoint saving
         if (step + 1) % save_freq == 0 and is_main_process():
             logger.info(f"Saving checkpoint at step {step + 1}...")
 
-            # Get the actual policy (unwrap DDP if necessary)
             policy_to_save = policy.module if isinstance(policy, DDP) else policy
 
             checkpoint_path = checkpoints_dir / f"checkpoint_step_{step + 1}.pt"
@@ -1083,7 +1014,6 @@ def train(
                 "config": config,
             }
 
-            # Save normalization stats if normalizer is used
             if normalizer is not None:
                 checkpoint_dict["normalization_stats"] = normalizer.stats
 
@@ -1108,42 +1038,39 @@ def train(
         except Exception as e:
             logger.warning(f"Failed to upload loss spike table to W&B: {e}")
 
-    # Save final checkpoint as .pt (matching inference format)
+    # Save final checkpoint
     if is_main_process():
         logger.info("=" * 80)
         logger.info("Saving final model...")
         logger.info("=" * 80)
 
-        # Get the actual policy (unwrap DDP if necessary)
         policy_to_save = policy.module if isinstance(policy, DDP) else policy
 
-        # Compute normalization statistics from dataset
+        # Compute normalization statistics
         logger.info("Computing action normalization statistics from dataset...")
         all_actions = []
         sample_count = 0
-        max_samples = 10000  # Sample up to 10k actions for statistics
+        max_samples = 10000
 
         for batch in dataloader:
             if "action" in batch:
                 actions = batch["action"]
-                # Handle different action shapes: (B, T, D) or (B, D)
                 if actions.ndim == 3:
-                    actions = actions.reshape(-1, actions.shape[-1])  # (B*T, D)
+                    actions = actions.reshape(-1, actions.shape[-1])
                 elif actions.ndim == 2:
-                    pass  # Already (B, D)
+                    pass
                 all_actions.append(actions.cpu().numpy())
                 sample_count += actions.shape[0]
 
             if sample_count >= max_samples:
                 break
 
-        # Compute statistics
         if len(all_actions) > 0:
             all_actions = np.concatenate(all_actions, axis=0)
-            action_min = all_actions.min(axis=0)  # (D,)
-            action_max = all_actions.max(axis=0)  # (D,)
-            action_mean = all_actions.mean(axis=0)  # (D,)
-            action_std = all_actions.std(axis=0)  # (D,)
+            action_min = all_actions.min(axis=0)
+            action_max = all_actions.max(axis=0)
+            action_mean = all_actions.mean(axis=0)
+            action_std = all_actions.std(axis=0)
 
             logger.info(f"Action statistics computed from {len(all_actions)} samples:")
             logger.info(f"  Min: {action_min}")
@@ -1151,59 +1078,57 @@ def train(
             logger.info(f"  Mean: {action_mean}")
             logger.info(f"  Std: {action_std}")
         else:
-            logger.warning("No actions found in dataset, using default normalization")
+            logger.warning("No actions found, using default normalization")
             action_dim = 6
             action_min = np.array([-1.0] * action_dim)
             action_max = np.array([1.0] * action_dim)
             action_mean = np.array([0.0] * action_dim)
             action_std = np.array([1.0] * action_dim)
 
-        # Save as .pt checkpoint (matching lerobot_to_MECA.py format)
+        # Save final checkpoint
         final_checkpoint_path = checkpoints_dir / "checkpoint_latest.pt"
 
         checkpoint_dict = {
             "step": total_steps,
-            "epoch": 0,  # Not used in this training script
+            "epoch": 0,
             "policy_state_dict": policy_to_save.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "config": config,
-            # Normalization statistics (for inference)
             "action_min": action_min,
             "action_max": action_max,
             "action_mean": action_mean,
             "action_std": action_std,
         }
 
-        # Save normalization stats if normalizer is used
         if normalizer is not None:
             checkpoint_dict["normalization_stats"] = normalizer.stats
 
         torch.save(checkpoint_dict, final_checkpoint_path)
         logger.info(f"Saved final checkpoint (.pt) to: {final_checkpoint_path}")
 
-        # Also save HuggingFace format for compatibility
+        # Also save HuggingFace format
         hf_checkpoint_path = checkpoints_dir / "final_hf"
         policy_to_save.save_pretrained(hf_checkpoint_path)
         logger.info(f"Saved HuggingFace format to: {hf_checkpoint_path}")
 
         logger.info("=" * 80)
-        logger.info("Training completed successfully!")
+        logger.info("Simulation Training completed successfully!")
         logger.info("=" * 80)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train SmolVLA Policy on HDF5 VLA Dataset")
+    parser = argparse.ArgumentParser(description="Train SmolVLA Policy on Simulation HDF5 Data")
     parser.add_argument("--config", type=str, required=True, help="Path to config YAML file")
     parser.add_argument("--batch_size", type=int, default=None, help="Override batch size")
     parser.add_argument("--steps", type=int, default=None, help="Override training steps")
     parser.add_argument("--lr", type=float, default=None, help="Override learning rate")
     parser.add_argument("--output_dir", type=str, default=None, help="Override output directory")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
-    parser.add_argument("--reset_scheduler", action="store_true", help="Reset scheduler when resuming (re-warmup LR)")
+    parser.add_argument("--reset_scheduler", action="store_true", help="Reset scheduler when resuming")
     args = parser.parse_args()
 
-    # Setup distributed training (following lerobot_train.py)
+    # Setup distributed training
     rank, world_size, local_rank, is_distributed = setup_distributed()
 
     # Load config
@@ -1234,31 +1159,25 @@ def main():
     # Check if validation is enabled
     validation_enabled = config.get("validation", {}).get("enable", False)
 
-    # Create dataset (with validation split if enabled)
+    # Create dataset with validation split if enabled
     if validation_enabled:
         train_dataset, val_dataset, val_episode_indices = create_dataset_from_config(config, val_split=True)
 
-        # Get all HDF5 files for validation info saving
         dataset_cfg = config["dataset"]
         root_dir = Path(dataset_cfg["root_dir"])
-        if "hdf5_files" in dataset_cfg:
-            all_hdf5_files = [root_dir / f for f in dataset_cfg["hdf5_files"]]
-        else:
-            all_hdf5_files = sorted(list(root_dir.rglob("*.h5")) + list(root_dir.rglob("*.hdf5")))
+        all_hdf5_files = sorted(list(root_dir.rglob("*.h5")) + list(root_dir.rglob("*.hdf5")))
     else:
         train_dataset, val_dataset, val_episode_indices = create_dataset_from_config(config, val_split=False)
         all_hdf5_files = None
 
-    # Create train dataloader with distributed sampler (following lerobot_train.py)
+    # Create train dataloader with distributed sampler
     train_sampler = DistributedSampler(train_dataset, shuffle=False) if is_distributed else None
 
-    # Use num_workers from config (set to 0 to avoid shared memory OOM in DDP)
-    # With 5 GPUs and large images (512x512x3), multi-worker DataLoader uses too much shared memory
     num_workers = config["training"].get("num_workers", 0)
 
     if is_main_process():
         if num_workers == 0:
-            logger.info("DataLoader: num_workers=0 (loading in main process to avoid shared memory OOM)")
+            logger.info("DataLoader: num_workers=0 (loading in main process)")
         else:
             logger.info(f"DataLoader: num_workers={num_workers}")
 
@@ -1267,12 +1186,12 @@ def main():
         batch_size=config["training"]["batch_size"],
         shuffle=(train_sampler is None),
         num_workers=num_workers,
-        pin_memory=config["training"].get("pin_memory", True),  # Enable for faster GPU transfer
+        pin_memory=config["training"].get("pin_memory", True),
         sampler=train_sampler,
         collate_fn=hdf5_lerobot_collate_fn,
         drop_last=False,
-        prefetch_factor=2 if num_workers > 0 else None,  # Prefetch 2 batches per worker
-        persistent_workers=(num_workers > 0),  # Keep workers alive for better performance
+        prefetch_factor=2 if num_workers > 0 else None,
+        persistent_workers=(num_workers > 0),
     )
 
     # Create validation dataloader if validation is enabled
@@ -1281,7 +1200,7 @@ def main():
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=config["training"]["batch_size"],
-            shuffle=False,  # No shuffling for validation
+            shuffle=False,
             num_workers=num_workers,
             pin_memory=config["training"].get("pin_memory", True),
             collate_fn=hdf5_lerobot_collate_fn,
@@ -1292,18 +1211,18 @@ def main():
         if is_main_process():
             logger.info(f"Validation dataloader created")
 
-    dataloader = train_dataloader  # Keep backward compatibility
+    dataloader = train_dataloader
 
     # Create normalizer if normalization is enabled
     normalizer = None
     if config.get("normalization", {}).get("enable", False):
-        stats_file = config["normalization"].get("stats_file", "dataset_stats.yaml")
+        stats_file = config["normalization"].get("stats_file", "dataset_stats_sim.yaml")
         stats_path = Path(__file__).parent / stats_file
 
         if stats_path.exists():
             if is_main_process():
                 logger.info("=" * 80)
-                logger.info("Loading Normalization Statistics")
+                logger.info("Loading Normalization Statistics (Simulation)")
                 logger.info("=" * 80)
                 logger.info(f"Stats file: {stats_path}")
 
@@ -1325,13 +1244,13 @@ def main():
     # Create policy
     policy = create_policy_from_config(config, device)
 
-    # Wrap policy with DDP if using distributed training (following lerobot_train.py)
+    # Wrap policy with DDP if using distributed training
     if is_distributed:
         policy = DDP(
             policy,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=True,  # Set to True when freezing vision encoder and/or training expert only
+            find_unused_parameters=True,
         )
         if is_main_process():
             logger.info("Policy wrapped with DistributedDataParallel")
@@ -1375,7 +1294,6 @@ def main():
         logger.error(f"Training failed with error: {e}", exc_info=True)
         raise
     finally:
-        # Finish W&B run
         if is_main_process() and wandb_run is not None:
             wandb.finish()
         cleanup_distributed()

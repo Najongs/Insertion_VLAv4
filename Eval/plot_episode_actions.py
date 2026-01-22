@@ -10,7 +10,7 @@ python plot_episode_actions.py \
 
 # Episode name only (will search in dataset directory)
 python plot_episode_actions.py \
-    --episode episode_20260107_140151.h5 \
+    --episode episode_20260108_143239.h5 \
     --output_dir ./outputs/action_plots
 """
 

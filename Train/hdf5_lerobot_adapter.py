@@ -139,7 +139,18 @@ class HDF5LeRobotDataset(Dataset):
 
         # Get dataset shapes
         self.num_frames = self.h5file['action'].shape[0]
-        self.num_cameras = len(self.h5file['observations']['images'].keys())
+
+        # Get actual camera names from HDF5 file
+        self.actual_camera_names = sorted(list(self.h5file['observations']['images'].keys()))
+        self.num_cameras = len(self.actual_camera_names)
+
+        # Create mapping from camera index to actual camera name
+        # Expected: camera1, camera2, camera3
+        # Actual (sim): side_camera, tool_camera, top_camera
+        self.camera_name_mapping = {}
+        for cam_idx, actual_name in enumerate(self.actual_camera_names, start=1):
+            expected_name = f"camera{cam_idx}"
+            self.camera_name_mapping[expected_name] = actual_name
 
         # Determine state dimension
         if use_qpos and use_ee_pose:
@@ -156,6 +167,7 @@ class HDF5LeRobotDataset(Dataset):
         if episode_index == 0:
             logger.info(f"Loading HDF5 episodes from {self.hdf5_path.parent}")
             logger.info(f"  Cameras: {self.num_cameras} | State: {self.state_dim}D | Format: {'JPEG' if self.is_jpeg_format else 'GZIP'}")
+            logger.info(f"  Camera mapping: {self.camera_name_mapping}")
             if self.use_ee_pose_delta_as_action:
                 logger.info("  Action mode: 'use_ee_pose_delta_as_action' is ENABLED")
 
@@ -290,6 +302,7 @@ class HDF5LeRobotDataset(Dataset):
         # Process images: Load temporal observations and stack to (n_obs_steps, C, H, W)
         for cam_idx in range(1, self.num_cameras + 1):
             cam_key = f"camera{cam_idx}"
+            actual_cam_name = self.camera_name_mapping.get(cam_key, cam_key)
             try:
                 # Check if this camera should be dropped out
                 if cam_idx not in active_cameras:
@@ -297,10 +310,10 @@ class HDF5LeRobotDataset(Dataset):
                     lerobot_sample[f"observation.images.{cam_key}"] = torch.zeros(self.n_obs_steps, 3, 512, 512)
                     continue
 
-                # Load temporal images from HDF5
+                # Load temporal images from HDF5 using actual camera name
                 img_tensors = []
                 for obs_idx in obs_indices:
-                    raw_data = self.h5file['observations']['images'][cam_key][obs_idx]
+                    raw_data = self.h5file['observations']['images'][actual_cam_name][obs_idx]
 
                     # Decode based on format
                     if self.is_jpeg_format:
@@ -347,7 +360,7 @@ class HDF5LeRobotDataset(Dataset):
                 lerobot_sample[f"observation.images.{cam_key}"] = torch.stack(img_tensors, dim=0)
 
             except Exception as e:
-                logger.warning(f"Failed to load {cam_key} at frame {idx}: {e}")
+                logger.warning(f"Failed to load {cam_key} ({actual_cam_name}) at frame {idx}: {e}")
                 # Create dummy images if loading fails
                 lerobot_sample[f"observation.images.{cam_key}"] = torch.zeros(self.n_obs_steps, 3, 512, 512)
 

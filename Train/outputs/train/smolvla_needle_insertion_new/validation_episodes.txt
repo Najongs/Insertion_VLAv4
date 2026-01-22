@@ -1,18 +1,28 @@
 Validation Episodes
 ================================================================================
 
-Total episodes: 825
-Validation episodes: 10
-Validation episode indices: [64, 101, 169, 361, 403, 439, 479, 685, 778, 796]
+Total episodes: 933
+Validation episodes: 20
+Validation episode indices: [64, 101, 133, 169, 207, 227, 246, 361, 372, 403, 439, 447, 479, 500, 547, 685, 687, 695, 778, 796]
 
 Validation episode paths:
   [64] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260106/2_JYT/episode_20260106_160739_trimmed_0_264.h5
   [101] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260106/3_KHC/episode_20260106_162754.h5
+  [133] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260106/4_DHH/episode_20260106_151749.h5
   [169] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260107/1_MIN/episode_20260107_154224.h5
+  [207] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260107/2_JYT/episode_20260107_141637.h5
+  [227] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260107/2_JYT/episode_20260107_161146.h5
+  [246] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260107/2_JYT/episode_20260107_162346.h5
   [361] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260108/1_MIN/episode_20260108_172614.h5
+  [372] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260108/1_MIN/episode_20260108_173229.h5
   [403] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260108/2_JYT/episode_20260108_145639.h5
   [439] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260108/3_KHC/episode_20260108_142911.h5
+  [447] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260108/3_KHC/episode_20260108_162234.h5
   [479] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260108/4_DHH/episode_20260108_155528.h5
+  [500] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260109/1_KTY/episode_20260109_135047.h5
+  [547] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260112/episode_20260112_152145.h5
   [685] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260114/episode_20260114_155203.h5
+  [687] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260114/episode_20260114_155336.h5
+  [695] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260114/episode_20260114_155745.h5
   [778] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260116/episode_20260116_093747.h5
   [796] /home/najo/NAS/VLA/dataset/New_dataset/collected_data/Eye_trocar/Eye_trocar/260116/episode_20260116_094734.h5

@@ -92,7 +92,7 @@ echo ""
 # Training configuration
 CONFIG_FILE="train_config_smolvla_normalized.yaml"
 BATCH_SIZE=16      # Per-GPU batch size (=80 with 5 GPUs) - MAXIMIZED!
-STEPS=10000        # Total training steps
+STEPS=50000        # Total training steps
 LR=0.0001          # Learning rate (1e-4, SmolVLA default)
 
 # Note: With gradient accumulation (x1), effective batch size = 80 * 1 = 80

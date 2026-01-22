@@ -7,6 +7,14 @@ __pycache__/
 # C extensions
 .mcp.json
 *.mp4
+/random_backgrounds
+random_backgrounds/
+STL/
+OUTPUT/
+outputs/
+
+textures/
+URDF/
 /wandb
 /openai
 wandb/

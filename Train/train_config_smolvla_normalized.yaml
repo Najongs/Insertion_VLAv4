@@ -116,7 +116,7 @@ lora:
 # --------------------------------------------------------
 training:
   # Training steps (paper fine-tuning on real: 200k, but good results with fewer)
-  steps: 10000
+  steps: 50000
 
   # Batch size (paper fine-tuning: 64, adjust for your GPU memory)
   # With 5 GPUs: 8 per GPU = 40 total (reduce from paper's 64 for memory)
@@ -132,13 +132,13 @@ training:
 
   # Logging and saving
   log_freq: 100
-  save_freq: 1000
+  save_freq: 2000
 
   # Temporal consistency loss weight
   lambda_temporal: 0.1
 
   # Loss spike detection (logs batches with abnormally high loss)
-  loss_spike_threshold: 3.0  # Multiplier of moving average (e.g., 3.0 = log if loss > 3x avg)
+  loss_spike_threshold: 10.0  # Multiplier of moving average (e.g., 3.0 = log if loss > 3x avg)
 
   # Mixed Precision Training (paper: bfloat16)
   # Note: Use bfloat16 instead of float16 for better numerical stability
@@ -146,7 +146,7 @@ training:
   use_bfloat16: true     # Paper optimization
 
   # Torch optimizations (paper: torch.compile)
-  use_torch_compile: false  # Set to true for faster training (requires PyTorch 2.0+)
+  use_torch_compile: true  # Set to true for faster training (requires PyTorch 2.0+)
 
 # Validation Configuration
 # -------------------------
@@ -155,10 +155,10 @@ validation:
   enable: true
 
   # Number of episodes to use for validation
-  num_episodes: 10
+  num_episodes: 20
 
   # Validation frequency (every N steps)
-  val_freq: 1000
+  val_freq: 2000
 
 # Optimizer Configuration (Paper Settings)
 # -----------------------------------------
@@ -175,10 +175,10 @@ optimizer:
 scheduler:
   # Paper: 100-step warmup for pretraining
   # For fine-tuning, use ~1% of total steps
-  num_warmup_steps: 200
+  num_warmup_steps: 1000
 
   # Cosine decay (paper: decay to 2.5e-6)
-  num_decay_steps: 10000     # Matches training steps
+  num_decay_steps: 50000     # Matches training steps
   peak_lr: 0.0001            # 1e-4
   decay_lr: 0.0000025        # 2.5e-6 (paper minimum)
 
